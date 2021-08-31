@@ -353,6 +353,7 @@ def add_variant_to_order(
             translated_product_name=translated_product_name,
             translated_variant_name=translated_variant_name,
             product_sku=variant.sku,
+            product_id=variant.get_global_id(),
             is_shipping_required=variant.is_shipping_required(),
             quantity=quantity,
             unit_price=unit_price,
