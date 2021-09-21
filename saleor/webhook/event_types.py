@@ -19,6 +19,10 @@ class WebhookEventType:
     FULFILLMENT_CANCELED = "fulfillment_canceled"
     ORDER_FULFILLED = "order_fulfilled"
 
+    SALE_CREATED = "sale_created"
+    SALE_UPDATED = "sale_updated"
+    SALE_DELETED = "sale_deleted"
+
     INVOICE_REQUESTED = "invoice_requested"
     INVOICE_DELETED = "invoice_deleted"
     INVOICE_SENT = "invoice_sent"
@@ -67,6 +71,9 @@ class WebhookEventType:
         ORDER_UPDATED: "Order updated",
         ORDER_CANCELLED: "Order cancelled",
         ORDER_FULFILLED: "Order fulfilled",
+        SALE_CREATED: "Sale created",
+        SALE_UPDATED: "Sale updated",
+        SALE_DELETED: "Sale deleted",
         INVOICE_REQUESTED: "Invoice requested",
         INVOICE_DELETED: "Invoice deleted",
         INVOICE_SENT: "Invoice sent",
@@ -107,6 +114,9 @@ class WebhookEventType:
         (ORDER_UPDATED, DISPLAY_LABELS[ORDER_UPDATED]),
         (ORDER_CANCELLED, DISPLAY_LABELS[ORDER_CANCELLED]),
         (ORDER_FULFILLED, DISPLAY_LABELS[ORDER_FULFILLED]),
+        (SALE_CREATED, DISPLAY_LABELS[SALE_CREATED]),
+        (SALE_UPDATED, DISPLAY_LABELS[SALE_UPDATED]),
+        (SALE_DELETED, DISPLAY_LABELS[SALE_DELETED]),
         (INVOICE_REQUESTED, DISPLAY_LABELS[INVOICE_REQUESTED]),
         (INVOICE_DELETED, DISPLAY_LABELS[INVOICE_DELETED]),
         (INVOICE_SENT, DISPLAY_LABELS[INVOICE_SENT]),
