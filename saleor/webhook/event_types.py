@@ -1,6 +1,7 @@
 from ..core.permissions import (
     AccountPermissions,
     CheckoutPermissions,
+    DiscountPermissions,
     OrderPermissions,
     PagePermissions,
     PaymentPermissions,
@@ -166,6 +167,9 @@ class WebhookEventType:
         ORDER_UPDATED: OrderPermissions.MANAGE_ORDERS,
         ORDER_CANCELLED: OrderPermissions.MANAGE_ORDERS,
         ORDER_FULFILLED: OrderPermissions.MANAGE_ORDERS,
+        SALE_CREATED: DiscountPermissions.MANAGE_DISCOUNTS,
+        SALE_UPDATED: DiscountPermissions.MANAGE_DISCOUNTS,
+        SALE_DELETED: DiscountPermissions.MANAGE_DISCOUNTS,
         INVOICE_REQUESTED: OrderPermissions.MANAGE_ORDERS,
         INVOICE_DELETED: OrderPermissions.MANAGE_ORDERS,
         INVOICE_SENT: OrderPermissions.MANAGE_ORDERS,
