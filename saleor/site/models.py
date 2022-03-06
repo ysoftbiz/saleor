@@ -1,11 +1,11 @@
 from email.headerregistry import Address
 from email.utils import parseaddr
-from typing import Optional
+from typing import Final, Optional
 
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.exceptions import ImproperlyConfigured
-from django.core.validators import MaxLengthValidator, RegexValidator
+from django.core.validators import MaxLengthValidator, MinValueValidator, RegexValidator
 from django.db import models
 
 from ..core import TimePeriodType
@@ -17,6 +17,8 @@ from .error_codes import SiteErrorCode
 from .patch_sites import patch_contrib_sites
 
 patch_contrib_sites()
+
+DEFAULT_LIMIT_QUANTITY_PER_CHECKOUT: Final[int] = 50
 
 
 def email_sender_name_validators():
@@ -69,6 +71,19 @@ class SiteSettings(models.Model):
     automatically_confirm_all_new_orders = models.BooleanField(default=True)
     fulfillment_auto_approve = models.BooleanField(default=True)
     fulfillment_allow_unpaid = models.BooleanField(default=True)
+
+    # Duration in minutes
+    reserve_stock_duration_anonymous_user = models.IntegerField(blank=True, null=True)
+    reserve_stock_duration_authenticated_user = models.IntegerField(
+        blank=True, null=True
+    )
+
+    limit_quantity_per_checkout = models.IntegerField(
+        blank=True,
+        null=True,
+        default=DEFAULT_LIMIT_QUANTITY_PER_CHECKOUT,
+        validators=[MinValueValidator(1)],
+    )
 
     # gift card settings
     gift_card_expiry_type = models.CharField(

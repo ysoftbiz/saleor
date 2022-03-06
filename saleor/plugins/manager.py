@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -18,15 +19,21 @@ from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpResponse, HttpResponseNotFound
 from django.utils.module_loading import import_string
 from django_countries.fields import Country
+from graphene import Mutation
+from graphql import GraphQLError, ResolveInfo
+from graphql.execution import ExecutionResult
 from prices import Money, TaxedMoney
 
 from ..channel.models import Channel
 from ..checkout import base_calculations
+from ..checkout.interface import CheckoutTaxedPricesData
+from ..core.models import EventDelivery
 from ..core.payments import PaymentInterface
 from ..core.prices import quantize_price
 from ..core.taxes import TaxType, zero_taxed_money
 from ..discount import DiscountInfo
-from .base_plugin import ExternalAccessTokens
+from ..order.interface import OrderTaxedPricesData
+from .base_plugin import ExcludedShippingMethod, ExternalAccessTokens
 from .models import PluginConfiguration
 
 if TYPE_CHECKING:
@@ -34,6 +41,7 @@ if TYPE_CHECKING:
     from ..account.models import Address, User
     from ..checkout.fetch import CheckoutInfo, CheckoutLineInfo
     from ..checkout.models import Checkout
+    from ..core.middleware import Requestor
     from ..discount.models import Sale
     from ..invoice.models import Invoice
     from ..order.models import Fulfillment, Order, OrderLine
@@ -46,11 +54,11 @@ if TYPE_CHECKING:
         PaymentGateway,
         TokenConfig,
     )
-    from ..product.models import Product, ProductType, ProductVariant
+    from ..product.models import Collection, Product, ProductType, ProductVariant
+    from ..shipping.interface import ShippingMethodData
     from ..translation.models import Translation
     from ..warehouse.models import Stock
     from .base_plugin import BasePlugin
-
 
 NotifyEventTypeChoice = str
 
@@ -65,50 +73,78 @@ class PluginsManager(PaymentInterface):
     def _load_plugin(
         self,
         PluginClass: Type["BasePlugin"],
-        config,
+        db_configs_map: dict,
         channel: Optional["Channel"] = None,
+        requestor_getter=None,
     ) -> "BasePlugin":
-
-        if PluginClass.PLUGIN_ID in config:
-            existing_config = config[PluginClass.PLUGIN_ID]
-            plugin_config = existing_config.configuration
-            active = existing_config.active
-            channel = existing_config.channel
+        db_config = None
+        if PluginClass.PLUGIN_ID in db_configs_map:
+            db_config = db_configs_map[PluginClass.PLUGIN_ID]
+            plugin_config = db_config.configuration
+            active = db_config.active
+            channel = db_config.channel
         else:
             plugin_config = PluginClass.DEFAULT_CONFIGURATION
             active = PluginClass.get_default_active()
 
-        return PluginClass(configuration=plugin_config, active=active, channel=channel)
+        return PluginClass(
+            configuration=plugin_config,
+            active=active,
+            channel=channel,
+            requestor_getter=requestor_getter,
+            db_config=db_config,
+        )
 
-    def __init__(self, plugins: List[str]):
+    def __init__(self, plugins: List[str], requestor_getter=None):
         with opentracing.global_tracer().start_active_span("PluginsManager.__init__"):
-            self.plugins_per_channel = defaultdict(list)
             self.all_plugins = []
-            (
-                self._global_config,
-                self._configs_per_channel,
-            ) = self._get_all_plugin_configs()
             self.global_plugins = []
-            channels = Channel.objects.all()
-            for plugin_path in plugins:
+            self.plugins_per_channel = defaultdict(list)
 
+            global_db_configs, channel_db_configs = self._get_db_plugin_configs()
+            channels = Channel.objects.all()
+
+            for plugin_path in plugins:
                 with opentracing.global_tracer().start_active_span(f"{plugin_path}"):
                     PluginClass = import_string(plugin_path)
                     if not getattr(PluginClass, "CONFIGURATION_PER_CHANNEL", False):
-                        plugin = self._load_plugin(PluginClass, self._global_config)
+                        plugin = self._load_plugin(
+                            PluginClass,
+                            global_db_configs,
+                            requestor_getter=requestor_getter,
+                        )
                         self.global_plugins.append(plugin)
                         self.all_plugins.append(plugin)
                     else:
                         for channel in channels:
-                            channel_configs = self._configs_per_channel.get(channel, {})
+                            channel_configs = channel_db_configs.get(channel, {})
                             plugin = self._load_plugin(
-                                PluginClass, channel_configs, channel
+                                PluginClass, channel_configs, channel, requestor_getter
                             )
                             self.plugins_per_channel[channel.slug].append(plugin)
                             self.all_plugins.append(plugin)
 
             for channel in channels:
                 self.plugins_per_channel[channel.slug].extend(self.global_plugins)
+
+    def _get_db_plugin_configs(self):
+        with opentracing.global_tracer().start_active_span("_get_db_plugin_configs"):
+            qs = (
+                PluginConfiguration.objects.all()
+                .using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+                .prefetch_related("channel")
+            )
+            channel_configs = defaultdict(dict)
+            global_configs = {}
+            for db_plugin_config in qs:
+                channel = db_plugin_config.channel
+                if channel is None:
+                    global_configs[db_plugin_config.identifier] = db_plugin_config
+                else:
+                    channel_configs[channel][
+                        db_plugin_config.identifier
+                    ] = db_plugin_config
+            return global_configs, channel_configs
 
     def __run_method_on_plugins(
         self,
@@ -149,6 +185,11 @@ class PluginsManager(PaymentInterface):
             return previous_value
         return returned_value
 
+    def check_payment_balance(self, details: dict, channel_slug: str) -> dict:
+        return self.__run_method_on_plugins(
+            "check_payment_balance", None, details, channel_slug=channel_slug
+        )
+
     def change_user_address(
         self, address: "Address", address_type: Optional[str], user: Optional["User"]
     ) -> "Address":
@@ -164,7 +205,7 @@ class PluginsManager(PaymentInterface):
         address: Optional["Address"],
         discounts: Iterable[DiscountInfo],
     ) -> TaxedMoney:
-
+        currency = checkout_info.checkout.currency
         default_value = base_calculations.base_checkout_total(
             subtotal=self.calculate_checkout_subtotal(
                 checkout_info, lines, address, discounts
@@ -173,8 +214,15 @@ class PluginsManager(PaymentInterface):
                 checkout_info, lines, address, discounts
             ),
             discount=checkout_info.checkout.discount,
-            currency=checkout_info.checkout.currency,
+            currency=currency,
         )
+
+        if default_value <= zero_taxed_money(currency):
+            return quantize_price(
+                default_value,
+                currency,
+            )
+
         return quantize_price(
             self.__run_method_on_plugins(
                 "calculate_checkout_total",
@@ -185,7 +233,7 @@ class PluginsManager(PaymentInterface):
                 discounts,
                 channel_slug=checkout_info.channel.slug,
             ),
-            checkout_info.checkout.currency,
+            currency,
         )
 
     def calculate_checkout_subtotal(
@@ -202,7 +250,7 @@ class PluginsManager(PaymentInterface):
                 line_info,
                 address,
                 discounts,
-            )
+            ).price_with_sale
             for line_info in lines
         ]
         currency = checkout_info.checkout.currency
@@ -219,7 +267,7 @@ class PluginsManager(PaymentInterface):
         address: Optional["Address"],
         discounts: Iterable[DiscountInfo],
     ) -> TaxedMoney:
-        default_value = base_calculations.base_checkout_shipping_price(
+        default_value = base_calculations.base_checkout_delivery_price(
             checkout_info, lines
         )
         return quantize_price(
@@ -238,9 +286,12 @@ class PluginsManager(PaymentInterface):
     def calculate_order_shipping(self, order: "Order") -> TaxedMoney:
         if not order.shipping_method:
             return zero_taxed_money(order.currency)
-        shipping_price = order.shipping_method.channel_listings.get(
+        channel_listing = order.shipping_method.channel_listings.filter(
             channel_id=order.channel_id
-        ).price
+        ).first()
+        if not channel_listing:
+            return zero_taxed_money(order.currency)
+        shipping_price = channel_listing.price
         default_value = quantize_price(
             TaxedMoney(net=shipping_price, gross=shipping_price),
             shipping_price.currency,
@@ -290,25 +341,33 @@ class PluginsManager(PaymentInterface):
         checkout_line_info: "CheckoutLineInfo",
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],
-    ):
+    ) -> CheckoutTaxedPricesData:
         default_value = base_calculations.base_checkout_line_total(
             checkout_line_info,
             checkout_info.channel,
             discounts,
         )
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_checkout_line_total",
-                default_value,
-                checkout_info,
-                lines,
-                checkout_line_info,
-                address,
-                discounts,
-                channel_slug=checkout_info.channel.slug,
-            ),
-            checkout_info.checkout.currency,
+        line_total = self.__run_method_on_plugins(
+            "calculate_checkout_line_total",
+            default_value,
+            checkout_info,
+            lines,
+            checkout_line_info,
+            address,
+            discounts,
+            channel_slug=checkout_info.channel.slug,
         )
+        currency = checkout_info.checkout.currency
+        line_total.price_with_sale = quantize_price(
+            line_total.price_with_sale, currency
+        )
+        line_total.price_with_discounts = quantize_price(
+            line_total.price_with_discounts, currency
+        )
+        line_total.undiscounted_price = quantize_price(
+            line_total.undiscounted_price, currency
+        )
+        return line_total
 
     def calculate_order_line_total(
         self,
@@ -316,47 +375,56 @@ class PluginsManager(PaymentInterface):
         order_line: "OrderLine",
         variant: "ProductVariant",
         product: "Product",
-    ):
+    ) -> OrderTaxedPricesData:
         default_value = base_calculations.base_order_line_total(order_line)
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_order_line_total",
-                default_value,
-                order,
-                order_line,
-                variant,
-                product,
-                channel_slug=order.channel.slug,
-            ),
-            order.currency,
+        line_total = self.__run_method_on_plugins(
+            "calculate_order_line_total",
+            default_value,
+            order,
+            order_line,
+            variant,
+            product,
+            channel_slug=order.channel.slug,
         )
+        currency = order_line.currency
+        line_total.price_with_discounts = quantize_price(
+            line_total.price_with_discounts, currency
+        )
+        line_total.undiscounted_price = quantize_price(
+            line_total.undiscounted_price, currency
+        )
+        return line_total
 
     def calculate_checkout_line_unit_price(
         self,
-        total_line_price: TaxedMoney,
-        quantity: int,
         checkout_info: "CheckoutInfo",
         lines: Iterable["CheckoutLineInfo"],
         checkout_line_info: "CheckoutLineInfo",
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],
-    ):
+    ) -> CheckoutTaxedPricesData:
         default_value = base_calculations.base_checkout_line_unit_price(
-            total_line_price, quantity
+            checkout_line_info, checkout_info.channel, discounts
         )
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_checkout_line_unit_price",
-                default_value,
-                checkout_info,
-                lines,
-                checkout_line_info,
-                address,
-                discounts,
-                channel_slug=checkout_info.channel.slug,
-            ),
-            total_line_price.currency,
+        line_unit = self.__run_method_on_plugins(
+            "calculate_checkout_line_unit_price",
+            default_value,
+            checkout_info,
+            lines,
+            checkout_line_info,
+            address,
+            discounts,
+            channel_slug=checkout_info.channel.slug,
         )
+        currency = checkout_info.checkout.currency
+        line_unit.price_with_sale = quantize_price(line_unit.price_with_sale, currency)
+        line_unit.price_with_discounts = quantize_price(
+            line_unit.price_with_discounts, currency
+        )
+        line_unit.undiscounted_price = quantize_price(
+            line_unit.undiscounted_price, currency
+        )
+        return line_unit
 
     def calculate_order_line_unit(
         self,
@@ -364,21 +432,28 @@ class PluginsManager(PaymentInterface):
         order_line: "OrderLine",
         variant: "ProductVariant",
         product: "Product",
-    ) -> TaxedMoney:
-        unit_price = order_line.unit_price
-        default_value = quantize_price(unit_price, unit_price.currency)
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_order_line_unit",
-                default_value,
-                order,
-                order_line,
-                variant,
-                product,
-                channel_slug=order.channel.slug,
-            ),
-            order_line.currency,
+    ) -> OrderTaxedPricesData:
+        default_value = OrderTaxedPricesData(
+            undiscounted_price=order_line.undiscounted_unit_price,
+            price_with_discounts=order_line.unit_price,
         )
+        currency = order_line.currency
+        line_unit = self.__run_method_on_plugins(
+            "calculate_order_line_unit",
+            default_value,
+            order,
+            order_line,
+            variant,
+            product,
+            channel_slug=order.channel.slug,
+        )
+        line_unit.price_with_discounts = quantize_price(
+            line_unit.price_with_discounts, currency
+        )
+        line_unit.undiscounted_price = quantize_price(
+            line_unit.undiscounted_price, currency
+        )
+        return line_unit
 
     def get_checkout_line_tax_rate(
         self,
@@ -446,23 +521,6 @@ class PluginsManager(PaymentInterface):
             price.currency,
         )
 
-    def apply_taxes_to_shipping(
-        self, price: Money, shipping_address: "Address", channel_slug: str
-    ) -> TaxedMoney:
-        default_value = quantize_price(
-            TaxedMoney(net=price, gross=price), price.currency
-        )
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "apply_taxes_to_shipping",
-                default_value,
-                price,
-                shipping_address,
-                channel_slug=channel_slug,
-            ),
-            price.currency,
-        )
-
     def preprocess_order_creation(
         self,
         checkout_info: "CheckoutInfo",
@@ -486,6 +544,24 @@ class PluginsManager(PaymentInterface):
     def customer_updated(self, customer: "User"):
         default_value = None
         return self.__run_method_on_plugins("customer_updated", default_value, customer)
+
+    def collection_created(self, collection: "Collection"):
+        default_value = None
+        return self.__run_method_on_plugins(
+            "collection_created", default_value, collection
+        )
+
+    def collection_updated(self, collection: "Collection"):
+        default_value = None
+        return self.__run_method_on_plugins(
+            "collection_updated", default_value, collection
+        )
+
+    def collection_deleted(self, collection: "Collection"):
+        default_value = None
+        return self.__run_method_on_plugins(
+            "collection_deleted", default_value, collection
+        )
 
     def product_created(self, product: "Product"):
         default_value = None
@@ -537,6 +613,12 @@ class PluginsManager(PaymentInterface):
         default_value = None
         return self.__run_method_on_plugins(
             "order_created", default_value, order, channel_slug=order.channel.slug
+        )
+
+    def event_delivery_retry(self, event_delivery: "EventDelivery"):
+        default_value = None
+        return self.__run_method_on_plugins(
+            "event_delivery_retry", default_value, event_delivery
         )
 
     def order_confirmed(self, order: "Order"):
@@ -652,6 +734,15 @@ class PluginsManager(PaymentInterface):
         default_value = None
         return self.__run_method_on_plugins(
             "fulfillment_canceled",
+            default_value,
+            fulfillment,
+            channel_slug=fulfillment.order.channel.slug,
+        )
+
+    def tracking_number_updated(self, fulfillment: "Fulfillment"):
+        default_value = None
+        return self.__run_method_on_plugins(
+            "tracking_number_updated",
             default_value,
             fulfillment,
             channel_slug=fulfillment.order.channel.slug,
@@ -834,6 +925,44 @@ class PluginsManager(PaymentInterface):
             )
         return gateways
 
+    def list_shipping_methods_for_checkout(
+        self,
+        checkout: "Checkout",
+        channel_slug: Optional[str] = None,
+        active_only: bool = True,
+    ) -> List["ShippingMethodData"]:
+        channel_slug = checkout.channel.slug if checkout else channel_slug
+        plugins = self.get_plugins(channel_slug=channel_slug, active_only=active_only)
+        shipping_plugins = [
+            plugin
+            for plugin in plugins
+            if hasattr(plugin, "get_shipping_methods_for_checkout")
+        ]
+
+        shipping_methods = []
+        for plugin in shipping_plugins:
+            shipping_methods.extend(
+                # https://github.com/python/mypy/issues/9975
+                getattr(plugin, "get_shipping_methods_for_checkout")(checkout, None)
+            )
+        return shipping_methods
+
+    def get_shipping_method(
+        self,
+        shipping_method_id: str,
+        checkout: Optional["Checkout"] = None,
+        channel_slug: Optional[str] = None,
+    ):
+        if checkout:
+            methods = {
+                method.id: method
+                for method in self.list_shipping_methods_for_checkout(
+                    checkout=checkout, channel_slug=channel_slug
+                )
+            }
+            return methods.get(shipping_method_id)
+        return None
+
     def list_external_authentications(self, active_only: bool = True) -> List[dict]:
         auth_basic_method = "external_obtain_access_tokens"
         plugins = self.get_plugins(active_only=active_only)
@@ -868,22 +997,6 @@ class PluginsManager(PaymentInterface):
             f"Payment plugin {gateway} for {method_name}"
             " payment method is inaccessible!"
         )
-
-    def _get_all_plugin_configs(self):
-        with opentracing.global_tracer().start_active_span("_get_all_plugin_configs"):
-            if not hasattr(self, "_plugin_configs"):
-                plugin_configurations = PluginConfiguration.objects.prefetch_related(
-                    "channel"
-                ).all()
-                self._plugin_configs_per_channel = defaultdict(dict)
-                self._global_plugin_configs = {}
-                for pc in plugin_configurations:
-                    channel = pc.channel
-                    if channel is None:
-                        self._global_plugin_configs[pc.identifier] = pc
-                    else:
-                        self._plugin_configs_per_channel[channel][pc.identifier] = pc
-            return self._global_plugin_configs, self._plugin_configs_per_channel
 
     # FIXME these methods should be more generic
 
@@ -1072,7 +1185,55 @@ class PluginsManager(PaymentInterface):
             plugin, "external_verify", default_value, data, request
         )
 
+    def excluded_shipping_methods_for_order(
+        self,
+        order: "Order",
+        available_shipping_methods: List["ShippingMethodData"],
+    ) -> List[ExcludedShippingMethod]:
+        return self.__run_method_on_plugins(
+            "excluded_shipping_methods_for_order",
+            [],
+            order,
+            available_shipping_methods,
+        )
 
-def get_plugins_manager() -> PluginsManager:
+    def excluded_shipping_methods_for_checkout(
+        self,
+        checkout: "Checkout",
+        available_shipping_methods: List["ShippingMethodData"],
+    ) -> List[ExcludedShippingMethod]:
+        return self.__run_method_on_plugins(
+            "excluded_shipping_methods_for_checkout",
+            [],
+            checkout,
+            available_shipping_methods,
+        )
+
+    def perform_mutation(
+        self, mutation_cls: Mutation, root, info: ResolveInfo, data: dict
+    ) -> Optional[Union[ExecutionResult, GraphQLError]]:
+        """Invoke before each mutation is executed.
+
+        This allows to trigger specific logic before the mutation is executed
+        but only once the permissions are checked.
+
+        Returns one of:
+            - null if the execution shall continue
+            - graphql.GraphQLError
+            - graphql.execution.ExecutionResult
+        """
+        return self.__run_method_on_plugins(
+            "perform_mutation",
+            default_value=None,
+            mutation_cls=mutation_cls,
+            root=root,
+            info=info,
+            data=data,
+        )
+
+
+def get_plugins_manager(
+    requestor_getter: Optional[Callable[[], "Requestor"]] = None
+) -> PluginsManager:
     with opentracing.global_tracer().start_active_span("get_plugins_manager"):
-        return PluginsManager(settings.PLUGINS)
+        return PluginsManager(settings.PLUGINS, requestor_getter)

@@ -11,7 +11,8 @@ from graphene.utils.str_converters import to_camel_case
 
 from ...account import events as account_events
 from ...account.error_codes import AccountErrorCode
-from ...core.permissions import AccountPermissions
+from ...core.exceptions import PermissionDenied
+from ...core.permissions import AccountPermissions, has_one_of_permissions
 
 if TYPE_CHECKING:
     from django.db.models import QuerySet
@@ -463,14 +464,33 @@ def look_for_permission_in_users_with_manage_staff(
 
 
 def requestor_has_access(
-    requestor: Union["User", "App"], owner: Optional["User"], perm
-):
+    requestor: Union["User", "App"], owner: Optional["User"], *perms
+) -> bool:
     """Check if requestor can access data.
 
-    Args:
-        requestor: requestor user or app
-        owner: data owner
-        perm: permission which give the access to the data
-
+    :param requestor: Requestor user or app.
+    :param owner: Data owner.
+    :param perms:
+        Permissions which can give the access to the data.
+        Requestor needs to have at least one of given permissions
+        to get access to protected resource.
     """
-    return requestor == owner or requestor.has_perm(perm)
+    return requestor == owner or has_one_of_permissions(requestor, perms)
+
+
+def check_requestor_access(
+    requestor: Union["User", "App"], owner: Optional["User"], *perms
+) -> None:
+    """Confirm that requestor can access data, raise `PermissionDenied` otherwise.
+
+    :param requestor: Requestor user or app.
+    :param owner: Data owner.
+    :param perms:
+        Permissions which can give the access to the data.
+        Requestor needs to have at least one of given permissions
+        to get access to protected resource.
+
+    :raises PermissionDenied: if requestor cannot access data
+    """
+    if not requestor_has_access(requestor, owner, *perms):
+        raise PermissionDenied(permissions=perms)

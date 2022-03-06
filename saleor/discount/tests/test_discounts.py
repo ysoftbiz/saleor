@@ -18,7 +18,6 @@ from ..models import (
     VoucherChannelListing,
     VoucherCustomer,
 )
-from ..templatetags.voucher import discount_as_negative
 from ..utils import (
     add_voucher_usage_by_customer,
     decrease_voucher_usage,
@@ -410,7 +409,7 @@ def test_specific_products_voucher_checkout_discount(
     )
     checkout = checkout_with_item
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
     manager = get_plugins_manager()
     discount = get_voucher_discount_for_checkout(
@@ -463,7 +462,7 @@ def test_sale_applies_to_correct_products(product_type, category, channel_USD):
         collection_ids=set(),
         variants_ids=set(),
     )
-    product_discount = get_product_discount_on_sale(
+    _, product_discount = get_product_discount_on_sale(
         variant.product, set(), discount, channel_USD
     )
 
@@ -725,24 +724,6 @@ def test_sale_active(current_date, start_date, end_date, is_active, channel_USD)
     )
     sale_is_active = Sale.objects.active(date=current_date).exists()
     assert is_active == sale_is_active
-
-
-def test_discount_as_negative():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount)
-    assert result == "-$10.00"
-
-
-def test_discount_as_negative_for_zero_value():
-    discount = Money(0, "USD")
-    result = discount_as_negative(discount)
-    assert result == "$0.00"
-
-
-def test_discount_as_negative_for_html():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount, True)
-    assert result == '-<span class="currency">$</span>10.00'
 
 
 def test_get_fixed_sale_discount(sale):

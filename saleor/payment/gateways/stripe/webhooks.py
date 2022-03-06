@@ -1,25 +1,36 @@
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import ValidationError
 from django.core.handlers.wsgi import WSGIRequest
 from django.db.models import Prefetch
 from django.http import HttpResponse
 from stripe.error import SignatureVerificationError
 from stripe.stripe_object import StripeObject
 
+from ....checkout.calculations import calculate_checkout_total_with_gift_cards
 from ....checkout.complete_checkout import complete_checkout
 from ....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from ....checkout.models import Checkout
 from ....core.transactions import transaction_with_commit_on_errors
 from ....discount.utils import fetch_active_discounts
 from ....order.actions import order_captured, order_refunded, order_voided
+from ....order.fetch import fetch_order_info
 from ....order.models import Order
 from ....plugins.manager import get_plugins_manager
 from ... import ChargeStatus, TransactionKind
+from ...gateway import payment_refund_or_void
 from ...interface import GatewayConfig, GatewayResponse
 from ...models import Payment
-from ...utils import create_transaction, gateway_postprocess, price_from_minor_unit
+from ...utils import (
+    create_transaction,
+    gateway_postprocess,
+    price_from_minor_unit,
+    try_void_or_refund_inactive_payment,
+    update_payment_charge_status,
+    update_payment_method_details,
+)
 from .consts import (
     WEBHOOK_AUTHORIZED_EVENT,
     WEBHOOK_CANCELED_EVENT,
@@ -28,7 +39,11 @@ from .consts import (
     WEBHOOK_REFUND_EVENT,
     WEBHOOK_SUCCESS_EVENT,
 )
-from .stripe_api import construct_stripe_event, update_payment_method
+from .stripe_api import (
+    construct_stripe_event,
+    get_payment_method_details,
+    update_payment_method,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +121,7 @@ def _get_payment(payment_intent_id: str) -> Optional[Payment]:
             Prefetch("order", queryset=Order.objects.select_related("channel")),
         )
         .select_for_update(of=("self",))
-        .filter(transactions__token=payment_intent_id, is_active=True)
+        .filter(transactions__token=payment_intent_id)
         .first()
     )
 
@@ -140,7 +155,7 @@ def _finalize_checkout(
         psp_reference=payment_intent.id,
     )
 
-    create_transaction(
+    transaction = create_transaction(
         payment,
         kind=kind,
         payment_information=None,  # type: ignore
@@ -148,22 +163,51 @@ def _finalize_checkout(
         gateway_response=gateway_response,
     )
 
+    # To avoid zombie payments we have to update payment `charge_status` without
+    # changing `to_confirm` flag. In case when order cannot be created then
+    # payment will be refunded.
+    update_payment_charge_status(payment, transaction)
+    payment.refresh_from_db()
+    checkout.refresh_from_db()
+
     manager = get_plugins_manager()
     discounts = fetch_active_discounts()
-    lines = fetch_checkout_lines(checkout)  # type: ignore
+    lines, unavailable_variant_pks = fetch_checkout_lines(checkout)
+    if unavailable_variant_pks:
+        raise ValidationError("Some of the checkout lines variants are unavailable.")
     checkout_info = fetch_checkout_info(
         checkout, lines, discounts, manager  # type: ignore
     )
-    order, _, _ = complete_checkout(
+    checkout_total = calculate_checkout_total_with_gift_cards(
         manager=manager,
         checkout_info=checkout_info,
         lines=lines,
-        payment_data={},
-        store_source=False,
+        address=checkout.shipping_address or checkout.billing_address,
         discounts=discounts,
-        user=checkout.user or AnonymousUser(),  # type: ignore
-        app=None,
     )
+
+    try:
+        # when checkout total value is different than total amount from payments
+        # it means that some products has been removed during the payment was completed
+        if checkout_total.gross.amount != payment.total:
+            payment_refund_or_void(payment, manager, checkout_info.channel.slug)
+            raise ValidationError(
+                "Cannot complete checkout - some products do not exist anymore."
+            )
+
+        order, _, _ = complete_checkout(
+            manager=manager,
+            checkout_info=checkout_info,
+            lines=lines,
+            payment_data={},
+            store_source=False,
+            discounts=discounts,
+            user=checkout.user or AnonymousUser(),  # type: ignore
+            app=None,
+        )
+    except ValidationError as e:
+        logger.info("Failed to complete checkout %s.", checkout.pk, extra={"error": e})
+        return None
 
 
 def _update_payment_with_new_transaction(
@@ -217,6 +261,16 @@ def _update_payment_method_metadata(
         update_payment_method(api_key, payment_intent.payment_method, metadata)
 
 
+def update_payment_method_details_from_intent(
+    payment: Payment, payment_intent: StripeObject
+):
+    if payment_method_info := get_payment_method_details(payment_intent):
+        changed_fields: List[str] = []
+        update_payment_method_details(payment, payment_method_info, changed_fields)
+        if changed_fields:
+            payment.save(update_fields=changed_fields)
+
+
 def handle_authorized_payment_intent(
     payment_intent: StripeObject, gateway_config: "GatewayConfig", channel_slug: str
 ):
@@ -233,6 +287,19 @@ def handle_authorized_payment_intent(
         return
 
     _update_payment_method_metadata(payment, payment_intent, gateway_config)
+    update_payment_method_details_from_intent(payment, payment_intent)
+
+    if not payment.is_active:
+        transaction = _update_payment_with_new_transaction(
+            payment,
+            payment_intent,
+            TransactionKind.AUTH,
+            payment_intent.amount,
+            payment_intent.currency,
+        )
+        manager = get_plugins_manager()
+        try_void_or_refund_inactive_payment(payment, transaction, manager)
+        return
 
     if payment.order_id:
         if payment.charge_status == ChargeStatus.PENDING:
@@ -298,6 +365,10 @@ def handle_processing_payment_intent(
     if _channel_slug_is_different_from_payment_channel_slug(channel_slug, payment):
         return
 
+    if not payment.is_active:
+        # we can't cancel/refund processing payment
+        return
+
     if payment.order_id:
         # Order already created
         return
@@ -328,6 +399,18 @@ def handle_successful_payment_intent(
         return
 
     _update_payment_method_metadata(payment, payment_intent, gateway_config)
+    update_payment_method_details_from_intent(payment, payment_intent)
+
+    if not payment.is_active:
+        transaction = _update_payment_with_new_transaction(
+            payment,
+            payment_intent,
+            TransactionKind.CAPTURE,
+            payment_intent.amount_received,
+            payment_intent.currency,
+        )
+        try_void_or_refund_inactive_payment(payment, transaction, get_plugins_manager())
+        return
 
     if payment.order_id:
         if payment.charge_status in [ChargeStatus.PENDING, ChargeStatus.NOT_CHARGED]:
@@ -338,8 +421,9 @@ def handle_successful_payment_intent(
                 payment_intent.amount_received,
                 payment_intent.currency,
             )
+            order_info = fetch_order_info(payment.order)  # type: ignore
             order_captured(
-                payment.order,  # type: ignore
+                order_info,
                 None,
                 None,
                 capture_transaction.amount,

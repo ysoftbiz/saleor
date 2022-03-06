@@ -8,7 +8,7 @@ from stripe.stripe_object import StripeObject
 
 from .....plugins.models import PluginConfiguration
 from .... import TransactionKind
-from ....interface import GatewayResponse, StorePaymentMethodEnum
+from ....interface import GatewayResponse, PaymentMethodInfo, StorePaymentMethodEnum
 from ....utils import (
     create_payment_information,
     create_transaction,
@@ -314,11 +314,31 @@ def test_process_payment_with_customer_and_future_usage(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
-    payment_intent.status = SUCCESS_STATUS
+    payment_intent.status = "requires_payment_method"
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -334,8 +354,8 @@ def test_process_payment_with_customer_and_future_usage(
     response = plugin.process_payment(payment_info, None)
 
     assert response.is_success is True
-    assert response.action_required is False
-    assert response.kind == TransactionKind.CAPTURE
+    assert response.action_required is True
+    assert response.kind == TransactionKind.ACTION_TO_CONFIRM
     assert response.amount == payment_info.amount
     assert response.currency == payment_info.currency
     assert response.transaction_id == payment_intent_id
@@ -389,11 +409,15 @@ def test_process_payment_with_customer_and_future_usage_no_store(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {}
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
     payment_intent.status = SUCCESS_STATUS
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -420,6 +444,7 @@ def test_process_payment_with_customer_and_future_usage_no_store(
         "client_secret": client_secret,
         "id": payment_intent_id,
     }
+    assert response.payment_method_info is None
 
     api_key = plugin.config.connection_params["secret_api_key"]
     mocked_payment_intent.assert_called_once_with(
@@ -463,11 +488,31 @@ def test_process_payment_with_customer_and_payment_method(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
     payment_intent.status = SUCCESS_STATUS
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -494,6 +539,9 @@ def test_process_payment_with_customer_and_payment_method(
         "client_secret": client_secret,
         "id": payment_intent_id,
     }
+    assert response.payment_method_info == PaymentMethodInfo(
+        last_4="1234", exp_month=12, exp_year=2222, brand="visa", type="card"
+    )
 
     api_key = plugin.config.connection_params["secret_api_key"]
     mocked_payment_intent.assert_called_once_with(
@@ -539,11 +587,31 @@ def test_process_payment_with_payment_method_types(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
     payment_intent.status = SUCCESS_STATUS
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -571,6 +639,9 @@ def test_process_payment_with_payment_method_types(
         "client_secret": client_secret,
         "id": payment_intent_id,
     }
+    assert response.payment_method_info == PaymentMethodInfo(
+        last_4="1234", exp_month=12, exp_year=2222, brand="visa", type="card"
+    )
 
     api_key = plugin.config.connection_params["secret_api_key"]
     mocked_payment_intent.assert_called_once_with(
@@ -615,11 +686,31 @@ def test_process_payment_offline(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
     payment_intent.status = SUCCESS_STATUS
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -646,6 +737,9 @@ def test_process_payment_offline(
         "client_secret": client_secret,
         "id": payment_intent_id,
     }
+    assert response.payment_method_info == PaymentMethodInfo(
+        last_4="1234", exp_month=12, exp_year=2222, brand="visa", type="card"
+    )
 
     api_key = plugin.config.connection_params["secret_api_key"]
     mocked_payment_intent.assert_called_once_with(
@@ -696,11 +790,31 @@ def test_process_payment_with_customer_and_payment_method_raises_authentication_
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
     payment_intent.status = SUCCESS_STATUS
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=True)
 
@@ -728,6 +842,9 @@ def test_process_payment_with_customer_and_payment_method_raises_authentication_
         "client_secret": client_secret,
         "id": payment_intent_id,
     }
+    assert response.payment_method_info == PaymentMethodInfo(
+        last_4="1234", exp_month=12, exp_year=2222, brand="visa", type="card"
+    )
 
     api_key = plugin.config.connection_params["secret_api_key"]
     mocked_payment_intent.assert_called_once_with(
@@ -901,10 +1018,28 @@ def test_process_payment_with_manual_capture(
     dummy_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
+    dummy_charges = {
+        "charges": {
+            "data": [
+                {
+                    "payment_method_details": {
+                        "type": "card",
+                        "card": {
+                            "last4": "1234",
+                            "exp_year": "2222",
+                            "exp_month": "12",
+                            "brand": "visa",
+                        },
+                    }
+                }
+            ]
+        }
+    }
     payment_intent_id = "payment-intent-id"
     payment_intent.id = payment_intent_id
     payment_intent.client_secret = client_secret
     payment_intent.last_response.data = dummy_response
+    payment_intent.get.side_effect = dummy_charges.get
 
     plugin = stripe_plugin(auto_capture=False)
 
@@ -1014,13 +1149,19 @@ def test_confirm_payment_for_webhook(kind, stripe_plugin, payment_stripe_for_che
     ],
 )
 @patch("saleor.payment.gateways.stripe.stripe_api.stripe.PaymentIntent.retrieve")
-def test_confirm_payment(
-    mocked_intent_retrieve, kind, status, stripe_plugin, payment_stripe_for_checkout
+def test_confirm_payment_intent_without_details(
+    mocked_intent_retrieve,
+    kind,
+    status,
+    stripe_plugin,
+    payment_stripe_for_checkout,
+    stripe_payment_intent,
 ):
     gateway_response = {
         "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
     }
 
+    payment_intent = stripe_payment_intent
     payment_intent_id = "payment-intent-id"
 
     payment = payment_stripe_for_checkout
@@ -1034,7 +1175,7 @@ def test_confirm_payment(
         currency=payment.currency,
     )
 
-    payment_intent = StripeObject(id=payment_intent_id)
+    payment_intent["id"] = payment_intent_id
     payment_intent["amount"] = price_to_minor_unit(payment.total, payment.currency)
     payment_intent["status"] = status
     payment_intent["currency"] = payment.currency
@@ -1054,6 +1195,71 @@ def test_confirm_payment(
     assert response.currency == payment.currency
     assert response.transaction_id == payment_intent_id
     assert response.error is None
+    assert not response.payment_method_info
+
+
+@pytest.mark.parametrize(
+    "kind, status",
+    [
+        (TransactionKind.AUTH, AUTHORIZED_STATUS),
+        (TransactionKind.CAPTURE, SUCCESS_STATUS),
+    ],
+)
+@patch("saleor.payment.gateways.stripe.stripe_api.stripe.PaymentIntent.retrieve")
+def test_confirm_payment_intent_with_details(
+    mocked_intent_retrieve,
+    kind,
+    status,
+    stripe_plugin,
+    payment_stripe_for_checkout,
+    stripe_payment_intent_with_details,
+):
+    gateway_response = {
+        "id": "evt_1Ip9ANH1Vac4G4dbE9ch7zGS",
+    }
+
+    payment_intent = stripe_payment_intent_with_details
+    payment_intent_id = "payment-intent-id"
+
+    payment = payment_stripe_for_checkout
+    payment.transactions.create(
+        is_success=True,
+        action_required=False,
+        kind=TransactionKind.ACTION_TO_CONFIRM,
+        token=payment_intent_id,
+        gateway_response=gateway_response,
+        amount=payment.total,
+        currency=payment.currency,
+    )
+
+    payment_intent["id"] = payment_intent_id
+    payment_intent["amount"] = price_to_minor_unit(payment.total, payment.currency)
+    payment_intent["status"] = status
+    payment_intent["currency"] = payment.currency
+    mocked_intent_retrieve.return_value = payment_intent
+
+    payment_info = create_payment_information(
+        payment_stripe_for_checkout, payment_token=payment_intent_id
+    )
+
+    plugin = stripe_plugin()
+    response = plugin.confirm_payment(payment_info, None)
+
+    assert response.is_success is True
+    assert response.action_required is False
+    assert response.kind == kind
+    assert response.amount == payment.total
+    assert response.currency == payment.currency
+    assert response.transaction_id == payment_intent_id
+    assert response.error is None
+
+    payment_method_info = response.payment_method_info
+    assert payment_method_info
+    assert payment_method_info.brand == "visa"
+    assert payment_method_info.exp_month == 3
+    assert payment_method_info.exp_year == 2030
+    assert payment_method_info.last_4 == "3220"
+    assert payment_method_info.type == "card"
 
 
 @patch("saleor.payment.gateways.stripe.stripe_api.stripe.PaymentIntent.retrieve")

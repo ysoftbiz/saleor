@@ -1,12 +1,13 @@
 import itertools
 import uuid
-from typing import Set
+from typing import Iterable, Optional, Set
 
 from django.db import models
 from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q, Sum
 from django.db.models.expressions import Subquery
 from django.db.models.functions import Coalesce
 from django.db.models.query import QuerySet
+from django.utils import timezone
 
 from ..account.models import Address
 from ..channel.models import Channel
@@ -38,6 +39,11 @@ class WarehouseQueryset(models.QuerySet):
         This method should be used only if stocks quantity will be checked in further
         validation steps, for instance in checkout completion.
         """
+        if all(
+            line.variant.is_preorder_active()
+            for line in lines_qs.select_related("variant").only("variant_id")
+        ):
+            return self._for_country_click_and_collect(country)
 
         stocks_qs = Stock.objects.filter(
             product_variant__id__in=lines_qs.values("variant_id"),
@@ -54,6 +60,12 @@ class WarehouseQueryset(models.QuerySet):
         For `WarehouseClickAndCollect.LOCAL` all `CheckoutLine`s must be available from
         a single warehouse.
         """
+
+        if all(
+            line.variant.is_preorder_active()
+            for line in lines_qs.select_related("variant").only("variant_id")
+        ):
+            return self._for_country_click_and_collect(country)
 
         lines_quantity = (
             lines_qs.filter(variant_id=OuterRef("product_variant_id"))
@@ -92,6 +104,14 @@ class WarehouseQueryset(models.QuerySet):
                 & Q(click_and_collect_option=warehouse_cc_option_enum.LOCAL_STOCK)
                 | Q(click_and_collect_option=warehouse_cc_option_enum.ALL_WAREHOUSES)
             )
+        )
+
+    def _for_country_click_and_collect(self, country: str) -> QuerySet["Warehouse"]:
+        return self.for_country(country).filter(
+            click_and_collect_option__in=[
+                WarehouseClickAndCollectOption.LOCAL_STOCK,
+                WarehouseClickAndCollectOption.ALL_WAREHOUSES,
+            ]
         )
 
 
@@ -144,6 +164,17 @@ class StockQuerySet(models.QuerySet):
             )
         )
 
+    def annotate_reserved_quantity(self):
+        return self.annotate(
+            reserved_quantity=Coalesce(
+                Sum(
+                    "reservations__quantity_reserved",
+                    filter=Q(reservations__reserved_until__gt=timezone.now()),
+                ),
+                0,
+            )
+        )
+
     def for_channel(self, channel_slug: str):
         ShippingZoneChannel = Channel.shipping_zones.through  # type: ignore
         WarehouseShippingZone = ShippingZone.warehouses.through  # type: ignore
@@ -186,6 +217,20 @@ class StockQuerySet(models.QuerySet):
             product_variant=product_variant
         )
 
+    def get_variants_stocks_for_country(
+        self,
+        country_code: str,
+        channel_slug: str,
+        products_variants: Iterable[ProductVariant],
+    ):
+        """Return the stock information about the a stock for a given country.
+
+        Note it will raise a 'Stock.DoesNotExist' exception if no such stock is found.
+        """
+        return self.for_country_and_channel(country_code, channel_slug).filter(
+            product_variant__in=products_variants
+        )
+
     def get_product_stocks_for_country_and_channel(
         self, country_code: str, channel_slug: str, product: Product
     ):
@@ -200,6 +245,7 @@ class Stock(models.Model):
         ProductVariant, null=False, on_delete=models.CASCADE, related_name="stocks"
     )
     quantity = models.IntegerField(default=0)
+    quantity_allocated = models.IntegerField(default=0)
 
     objects = models.Manager.from_queryset(StockQuerySet)()
 
@@ -279,4 +325,71 @@ class PreorderAllocation(models.Model):
 
     class Meta:
         unique_together = [["order_line", "product_variant_channel_listing"]]
+        ordering = ("pk",)
+
+
+class ReservationQuerySet(models.QuerySet):
+    def not_expired(self):
+        return self.filter(reserved_until__gt=timezone.now())
+
+    def exclude_checkout_lines(self, checkout_lines: Optional[Iterable[CheckoutLine]]):
+        if checkout_lines:
+            return self.exclude(checkout_line__in=checkout_lines)
+
+        return self
+
+
+class PreorderReservation(models.Model):
+    checkout_line = models.ForeignKey(
+        CheckoutLine,
+        null=False,
+        blank=False,
+        on_delete=models.CASCADE,
+        related_name="preorder_reservations",
+    )
+    product_variant_channel_listing = models.ForeignKey(
+        ProductVariantChannelListing,
+        null=False,
+        blank=False,
+        on_delete=models.CASCADE,
+        related_name="preorder_reservations",
+    )
+    quantity_reserved = models.PositiveIntegerField(default=0)
+    reserved_until = models.DateTimeField()
+
+    objects = models.Manager.from_queryset(ReservationQuerySet)()
+
+    class Meta:
+        unique_together = [["checkout_line", "product_variant_channel_listing"]]
+        indexes = [
+            models.Index(fields=["checkout_line", "reserved_until"]),
+        ]
+        ordering = ("pk",)
+
+
+class Reservation(models.Model):
+    checkout_line = models.ForeignKey(
+        CheckoutLine,
+        null=False,
+        blank=False,
+        on_delete=models.CASCADE,
+        related_name="reservations",
+    )
+    stock = models.ForeignKey(
+        Stock,
+        null=False,
+        blank=False,
+        on_delete=models.CASCADE,
+        related_name="reservations",
+    )
+    quantity_reserved = models.PositiveIntegerField(default=0)
+    reserved_until = models.DateTimeField()
+
+    objects = models.Manager.from_queryset(ReservationQuerySet)()
+
+    class Meta:
+        unique_together = [["checkout_line", "stock"]]
+        indexes = [
+            models.Index(fields=["checkout_line", "reserved_until"]),
+        ]
         ordering = ("pk",)

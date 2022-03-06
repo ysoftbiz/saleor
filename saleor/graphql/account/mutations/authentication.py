@@ -21,6 +21,7 @@ from ....core.jwt import (
     jwt_decode,
 )
 from ....core.permissions import get_permissions_from_names
+from ...core.fields import JSONString
 from ...core.mutations import BaseMutation
 from ...core.types.common import AccountError
 from ..types import User
@@ -82,7 +83,7 @@ class CreateToken(BaseMutation):
 
     @classmethod
     def _retrieve_user_from_credentials(cls, email, password) -> Optional[models.User]:
-        user = models.User.objects.filter(email=email, is_active=True).first()
+        user = models.User.objects.filter(email=email).first()
         if user and user.check_password(password):
             return user
         return None
@@ -99,6 +100,25 @@ class CreateToken(BaseMutation):
                     )
                 }
             )
+        if not user.is_active and not user.last_login:
+            raise ValidationError(
+                {
+                    "email": ValidationError(
+                        "Account needs to be confirmed via email.",
+                        code=AccountErrorCode.ACCOUNT_NOT_CONFIRMED.value,
+                    )
+                }
+            )
+
+        if not user.is_active and user.last_login:
+            raise ValidationError(
+                {
+                    "email": ValidationError(
+                        "Account inactive.",
+                        code=AccountErrorCode.INACTIVE.value,
+                    )
+                }
+            )
         return user
 
     @classmethod
@@ -110,7 +130,7 @@ class CreateToken(BaseMutation):
         info.context.refresh_token = refresh_token
         info.context._cached_user = user
         user.last_login = timezone.now()
-        user.save(update_fields=["last_login"])
+        user.save(update_fields=["last_login", "updated_at"])
         return cls(
             errors=[],
             user=user,
@@ -166,7 +186,7 @@ class RefreshToken(BaseMutation):
         if not refresh_token:
             raise ValidationError(
                 {
-                    "refreshToken": ValidationError(
+                    "refresh_token": ValidationError(
                         "Missing refreshToken",
                         code=AccountErrorCode.JWT_MISSING_TOKEN.value,
                     )
@@ -176,7 +196,7 @@ class RefreshToken(BaseMutation):
         if payload["type"] != JWT_REFRESH_TYPE:
             raise ValidationError(
                 {
-                    "refreshToken": ValidationError(
+                    "refresh_token": ValidationError(
                         "Incorrect refreshToken",
                         code=AccountErrorCode.JWT_INVALID_TOKEN.value,
                     )
@@ -186,11 +206,21 @@ class RefreshToken(BaseMutation):
 
     @classmethod
     def clean_csrf_token(cls, csrf_token, payload):
+        if not csrf_token:
+            msg = "CSRF token is required when refreshToken is provided by the cookie"
+            raise ValidationError(
+                {
+                    "csrf_token": ValidationError(
+                        msg,
+                        code=AccountErrorCode.REQUIRED.value,
+                    )
+                }
+            )
         is_valid = _compare_masked_tokens(csrf_token, payload["csrfToken"])
         if not is_valid:
             raise ValidationError(
                 {
-                    "csrfToken": ValidationError(
+                    "csrf_token": ValidationError(
                         "Invalid csrf token",
                         code=AccountErrorCode.JWT_INVALID_CSRF_TOKEN.value,
                     )
@@ -202,7 +232,7 @@ class RefreshToken(BaseMutation):
         try:
             user = get_user(payload)
         except ValidationError as e:
-            raise ValidationError({"refreshToken": e})
+            raise ValidationError({"refresh_token": e})
         return user
 
     @classmethod
@@ -277,14 +307,14 @@ class DeactivateAllUserTokens(BaseMutation):
     def perform_mutation(cls, root, info, **data):
         user = info.context.user
         user.jwt_token_key = get_random_string()
-        user.save(update_fields=["jwt_token_key"])
+        user.save(update_fields=["jwt_token_key", "updated_at"])
         return cls()
 
 
 class ExternalAuthenticationUrl(BaseMutation):
     """Prepare external authentication url for user by a custom plugin."""
 
-    authentication_data = graphene.JSONString(
+    authentication_data = JSONString(
         description="The data returned by authentication plugin."
     )
 
@@ -292,7 +322,7 @@ class ExternalAuthenticationUrl(BaseMutation):
         plugin_id = graphene.String(
             description="The ID of the authentication plugin.", required=True
         )
-        input = graphene.JSONString(
+        input = JSONString(
             required=True,
             description=(
                 "The data required by plugin to create external authentication url."
@@ -333,7 +363,7 @@ class ExternalObtainAccessTokens(BaseMutation):
         plugin_id = graphene.String(
             description="The ID of the authentication plugin.", required=True
         )
-        input = graphene.JSONString(
+        input = JSONString(
             required=True,
             description="The data required by plugin to create authentication data.",
         )
@@ -357,7 +387,7 @@ class ExternalObtainAccessTokens(BaseMutation):
         if access_tokens_response.user and access_tokens_response.user.id:
             info.context._cached_user = access_tokens_response.user
             access_tokens_response.user.last_login = timezone.now()
-            access_tokens_response.user.save(update_fields=["last_login"])
+            access_tokens_response.user.save(update_fields=["last_login", "updated_at"])
 
         return cls(
             token=access_tokens_response.token,
@@ -383,7 +413,7 @@ class ExternalRefresh(BaseMutation):
         plugin_id = graphene.String(
             description="The ID of the authentication plugin.", required=True
         )
-        input = graphene.JSONString(
+        input = JSONString(
             required=True,
             description="The data required by plugin to proceed the refresh process.",
         )
@@ -417,15 +447,13 @@ class ExternalRefresh(BaseMutation):
 class ExternalLogout(BaseMutation):
     """Logout user by a custom plugin."""
 
-    logout_data = graphene.JSONString(
-        description="The data returned by authentication plugin."
-    )
+    logout_data = JSONString(description="The data returned by authentication plugin.")
 
     class Arguments:
         plugin_id = graphene.String(
             description="The ID of the authentication plugin.", required=True
         )
-        input = graphene.JSONString(
+        input = JSONString(
             required=True,
             description="The data required by plugin to proceed the logout process.",
         )
@@ -451,13 +479,13 @@ class ExternalVerify(BaseMutation):
         default_value=False,
         description="Determine if authentication data is valid or not.",
     )
-    verify_data = graphene.JSONString(description="External data.")
+    verify_data = JSONString(description="External data.")
 
     class Arguments:
         plugin_id = graphene.String(
             description="The ID of the authentication plugin.", required=True
         )
-        input = graphene.JSONString(
+        input = JSONString(
             required=True,
             description="The data required by plugin to proceed the verification.",
         )

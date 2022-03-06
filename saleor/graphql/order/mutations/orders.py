@@ -8,7 +8,7 @@ from ....core.permissions import OrderPermissions
 from ....core.taxes import TaxError, zero_taxed_money
 from ....core.tracing import traced_atomic_transaction
 from ....giftcard.utils import deactivate_order_gift_cards, order_has_gift_card_lines
-from ....order import FulfillmentStatus, OrderLineData, OrderStatus, events, models
+from ....order import FulfillmentStatus, OrderStatus, events, models
 from ....order.actions import (
     cancel_order,
     clean_mark_order_as_paid,
@@ -20,16 +20,23 @@ from ....order.actions import (
     order_voided,
 )
 from ....order.error_codes import OrderErrorCode
+from ....order.fetch import OrderLineInfo, fetch_order_info
+from ....order.search import (
+    prepare_order_search_document_value,
+    update_order_search_document,
+)
 from ....order.utils import (
     add_variant_to_order,
     change_order_line_quantity,
     delete_order_line,
-    get_valid_shipping_methods_for_order,
     recalculate_order,
     update_order_prices,
 )
 from ....payment import PaymentError, TransactionKind, gateway
+from ....plugins.manager import PluginsManager
 from ....shipping import models as shipping_models
+from ....shipping.interface import ShippingMethodData
+from ....shipping.utils import convert_to_shipping_method_data
 from ...account.types import AddressInput
 from ...core.mutations import BaseMutation, ModelMutation
 from ...core.scalars import PositiveDecimal
@@ -44,6 +51,7 @@ from ...product.types import ProductVariant
 from ...shipping.types import ShippingMethod
 from ..types import Order, OrderEvent, OrderLine
 from ..utils import (
+    get_shipping_method_availability_error,
     validate_product_is_published_in_channel,
     validate_variant_channel_listings,
 )
@@ -51,30 +59,23 @@ from ..utils import (
 ORDER_EDITABLE_STATUS = (OrderStatus.DRAFT, OrderStatus.UNCONFIRMED)
 
 
-def clean_order_update_shipping(order, method):
+def clean_order_update_shipping(
+    order, method: ShippingMethodData, manager: "PluginsManager"
+):
     if not order.shipping_address:
         raise ValidationError(
             {
                 "order": ValidationError(
                     "Cannot choose a shipping method for an order without "
                     "the shipping address.",
-                    code=OrderErrorCode.ORDER_NO_SHIPPING_ADDRESS,
+                    code=OrderErrorCode.ORDER_NO_SHIPPING_ADDRESS.value,
                 )
             }
         )
 
-    valid_methods = get_valid_shipping_methods_for_order(order)
-    if valid_methods is None or method.pk not in valid_methods.values_list(
-        "id", flat=True
-    ):
-        raise ValidationError(
-            {
-                "shipping_method": ValidationError(
-                    "Shipping method cannot be used with this order.",
-                    code=OrderErrorCode.SHIPPING_METHOD_NOT_APPLICABLE,
-                )
-            }
-        )
+    error = get_shipping_method_availability_error(order, method, manager)
+    if error:
+        raise ValidationError({"shipping_method": error})
 
 
 def clean_order_cancel(order):
@@ -192,6 +193,7 @@ class OrderUpdate(DraftOrderCreate):
     class Meta:
         description = "Updates an order."
         model = models.Order
+        object_type = Order
         permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
@@ -230,6 +232,7 @@ class OrderUpdate(DraftOrderCreate):
         if instance.user_email:
             user = User.objects.filter(email=instance.user_email).first()
             instance.user = user
+        instance.search_document = prepare_order_search_document_value(instance)
         instance.save()
         update_order_prices(
             instance,
@@ -294,7 +297,9 @@ class OrderUpdateShipping(EditableOrderValidationMixin, BaseMutation):
             info,
             data.get("id"),
             only_type=Order,
-            qs=models.Order.objects.prefetch_related("lines"),
+            qs=models.Order.objects.prefetch_related(
+                "lines", "channel__shipping_method_listings"
+            ),
         )
         cls.validate_order(order)
 
@@ -342,6 +347,7 @@ class OrderUpdateShipping(EditableOrderValidationMixin, BaseMutation):
                     "shipping_price_net_amount",
                     "shipping_price_gross_amount",
                     "shipping_method_name",
+                    "updated_at",
                 ]
             )
             recalculate_order(order)
@@ -356,8 +362,26 @@ class OrderUpdateShipping(EditableOrderValidationMixin, BaseMutation):
                 "postal_code_rules"
             ),
         )
+        shipping_channel_listing = (
+            shipping_models.ShippingMethodChannelListing.objects.filter(
+                shipping_method=method, channel=order.channel
+            ).first()
+        )
+        if not shipping_channel_listing:
+            raise ValidationError(
+                {
+                    "shipping_method": ValidationError(
+                        "Shipping method not available in the given channel.",
+                        code=OrderErrorCode.SHIPPING_METHOD_NOT_APPLICABLE.value,
+                    )
+                }
+            )
 
-        clean_order_update_shipping(order, method)
+        shipping_method_data = convert_to_shipping_method_data(
+            method,
+            shipping_channel_listing,
+        )
+        clean_order_update_shipping(order, shipping_method_data, info.context.plugins)
 
         order.shipping_method = method
         shipping_price = info.context.plugins.calculate_order_shipping(order)
@@ -374,6 +398,7 @@ class OrderUpdateShipping(EditableOrderValidationMixin, BaseMutation):
                 "shipping_price_net_amount",
                 "shipping_price_gross_amount",
                 "shipping_tax_rate",
+                "updated_at",
             ]
         )
         update_order_prices(
@@ -507,6 +532,9 @@ class OrderMarkAsPaid(BaseMutation):
         mark_order_as_paid(
             order, user, app, info.context.plugins, transaction_reference
         )
+
+        update_order_search_document(order)
+
         return OrderMarkAsPaid(order=order)
 
 
@@ -538,7 +566,8 @@ class OrderCapture(BaseMutation):
             )
 
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
-        payment = order.get_last_payment()
+        order_info = fetch_order_info(order)
+        payment = order_info.payment
         clean_order_capture(payment)
 
         transaction = try_payment_action(
@@ -552,11 +581,12 @@ class OrderCapture(BaseMutation):
             amount=amount,
             channel_slug=order.channel.slug,
         )
+        order_info.payment.refresh_from_db()
         # Confirm that we changed the status to capture. Some payment can receive
         # asynchronous webhook with update status
         if transaction.kind == TransactionKind.CAPTURE:
             order_captured(
-                order,
+                order_info,
                 info.context.user,
                 info.context.app,
                 amount,
@@ -678,6 +708,7 @@ class OrderConfirm(ModelMutation):
     class Meta:
         description = "Confirms an unconfirmed order by changing status to unfulfilled."
         model = models.Order
+        object_type = Order
         permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
@@ -711,15 +742,16 @@ class OrderConfirm(ModelMutation):
     def perform_mutation(cls, root, info, **data):
         order = cls.get_instance(info, **data)
         order.status = OrderStatus.UNFULFILLED
-        order.save(update_fields=["status"])
-        payment = order.get_last_payment()
+        order.save(update_fields=["status", "updated_at"])
+        order_info = fetch_order_info(order)
+        payment = order_info.payment
         manager = info.context.plugins
         if payment and payment.is_authorized and payment.can_capture():
             gateway.capture(
                 payment, info.context.plugins, channel_slug=order.channel.slug
             )
             order_captured(
-                order,
+                order_info,
                 info.context.user,
                 info.context.app,
                 payment.total,
@@ -796,7 +828,9 @@ class OrderLinesCreate(EditableOrderValidationMixin, BaseMutation):
             raise ValidationError(error)
 
     @staticmethod
-    def add_lines_to_order(order, lines_to_add, user, app, manager):
+    def add_lines_to_order(
+        order, lines_to_add, user, app, manager, settings, discounts
+    ):
         try:
             return [
                 add_variant_to_order(
@@ -806,6 +840,8 @@ class OrderLinesCreate(EditableOrderValidationMixin, BaseMutation):
                     user,
                     app,
                     manager,
+                    settings,
+                    discounts=discounts,
                     allocate_stock=order.is_unconfirmed(),
                 )
                 for quantity, variant in lines_to_add
@@ -831,6 +867,8 @@ class OrderLinesCreate(EditableOrderValidationMixin, BaseMutation):
             info.context.user,
             info.context.app,
             info.context.plugins,
+            info.context.site.settings,
+            info.context.discounts,
         )
 
         # Create the products added event
@@ -842,6 +880,7 @@ class OrderLinesCreate(EditableOrderValidationMixin, BaseMutation):
         )
 
         recalculate_order(order)
+        update_order_search_document(order)
 
         func = get_webhook_handler_by_order_status(order.status, info)
         transaction.on_commit(lambda: func(order))
@@ -882,7 +921,7 @@ class OrderLineDelete(EditableOrderValidationMixin, BaseMutation):
             if order.is_unconfirmed()
             else None
         )
-        line_info = OrderLineData(
+        line_info = OrderLineInfo(
             line=line,
             quantity=line.quantity,
             variant=line.variant,
@@ -902,6 +941,7 @@ class OrderLineDelete(EditableOrderValidationMixin, BaseMutation):
                     "shipping_price_net_amount",
                     "shipping_price_gross_amount",
                     "shipping_method_name",
+                    "updated_at",
                 ]
             )
         # Create the removal event
@@ -913,6 +953,7 @@ class OrderLineDelete(EditableOrderValidationMixin, BaseMutation):
         )
 
         recalculate_order(order)
+        update_order_search_document(order)
         func = get_webhook_handler_by_order_status(order.status, info)
         transaction.on_commit(lambda: func(order))
         return OrderLineDelete(order=order, order_line=line)
@@ -930,6 +971,7 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
     class Meta:
         description = "Updates an order line of an order."
         model = models.OrderLine
+        object_type = OrderLine
         permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
@@ -961,7 +1003,7 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
             if instance.order.is_unconfirmed()
             else None
         )
-        line_info = OrderLineData(
+        line_info = OrderLineInfo(
             line=instance,
             quantity=instance.quantity,
             variant=instance.variant,

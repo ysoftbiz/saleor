@@ -1,4 +1,4 @@
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import graphene
 from django.core.exceptions import ValidationError
@@ -16,10 +16,12 @@ from ...payment import PaymentError, StorePaymentMethod, gateway
 from ...payment.error_codes import PaymentErrorCode
 from ...payment.utils import create_payment, is_currency_supported
 from ..account.i18n import I18nMixin
-from ..checkout.mutations import get_checkout_by_token
+from ..channel.utils import validate_channel
+from ..checkout.mutations.utils import get_checkout_by_token
 from ..checkout.types import Checkout
 from ..core.descriptions import ADDED_IN_31, DEPRECATED_IN_3X_INPUT
 from ..core.enums import to_enum
+from ..core.fields import JSONString
 from ..core.mutations import BaseMutation
 from ..core.scalars import UUID, PositiveDecimal
 from ..core.types import common as common_types
@@ -27,6 +29,9 @@ from ..core.validators import validate_one_of_args_is_in_mutation
 from ..meta.mutations import MetadataInput
 from .types import Payment, PaymentInitialized
 from .utils import metadata_contains_empty_key
+
+if TYPE_CHECKING:
+    from ...checkout import models as checkout_models
 
 
 def description(enum):
@@ -188,6 +193,14 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
                 }
             )
 
+    @staticmethod
+    def validate_checkout_email(checkout: "checkout_models.Checkout"):
+        if not checkout.email:
+            raise ValidationError(
+                "Checkout email must be set.",
+                code=PaymentErrorCode.CHECKOUT_EMAIL_NOT_SET.value,
+            )
+
     @classmethod
     def perform_mutation(cls, _root, info, checkout_id=None, token=None, **data):
         # DEPRECATED
@@ -203,6 +216,8 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
                 info, checkout_id or token, only_type=Checkout, field="checkout_id"
             )
 
+        cls.validate_checkout_email(checkout)
+
         data = data["input"]
         gateway = data["gateway"]
 
@@ -210,7 +225,30 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
         cls.validate_gateway(manager, gateway, checkout.currency)
         cls.validate_return_url(data)
 
-        lines = fetch_checkout_lines(checkout)
+        lines, unavailable_variant_pks = fetch_checkout_lines(checkout)
+        if unavailable_variant_pks:
+            not_available_variants_ids = {
+                graphene.Node.to_global_id("ProductVariant", pk)
+                for pk in unavailable_variant_pks
+            }
+            raise ValidationError(
+                {
+                    "token": ValidationError(
+                        "Some of the checkout lines variants are unavailable.",
+                        code=PaymentErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL.value,
+                        params={"variants": not_available_variants_ids},
+                    )
+                }
+            )
+        if not lines:
+            raise ValidationError(
+                {
+                    "lines": ValidationError(
+                        "Cannot create payment for checkout without lines.",
+                        code=PaymentErrorCode.NO_CHECKOUT_LINES.value,
+                    )
+                }
+            )
         checkout_info = fetch_checkout_info(
             checkout, lines, info.context.discounts, manager
         )
@@ -245,20 +283,23 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
             cls.validate_metadata_keys(metadata)
             metadata = {data.key: data.value for data in metadata}
 
-        payment = create_payment(
-            gateway=gateway,
-            payment_token=data.get("token", ""),
-            total=amount,
-            currency=checkout.currency,
-            email=checkout.get_customer_email(),
-            extra_data=extra_data,
-            # FIXME this is not a customer IP address. It is a client storefront ip
-            customer_ip_address=get_client_ip(info.context),
-            checkout=checkout,
-            return_url=data.get("return_url"),
-            store_payment_method=data["store_payment_method"],
-            metadata=metadata,
-        )
+        payment = None
+        if amount != 0:
+            payment = create_payment(
+                gateway=gateway,
+                payment_token=data.get("token", ""),
+                total=amount,
+                currency=checkout.currency,
+                email=checkout.get_customer_email(),
+                extra_data=extra_data,
+                # FIXME this is not a customer IP address. It is a client storefront ip
+                customer_ip_address=get_client_ip(info.context),
+                checkout=checkout,
+                return_url=data.get("return_url"),
+                store_payment_method=data["store_payment_method"],
+                metadata=metadata,
+            )
+
         return CheckoutPaymentCreate(payment=payment, checkout=checkout)
 
 
@@ -363,7 +404,7 @@ class PaymentInitialize(BaseMutation):
         channel = graphene.String(
             description="Slug of a channel for which the data should be returned.",
         )
-        payment_data = graphene.JSONString(
+        payment_data = JSONString(
             required=False,
             description=(
                 "Client-side generated data required to initialize the payment."
@@ -416,3 +457,95 @@ class PaymentInitialize(BaseMutation):
                 }
             )
         return PaymentInitialize(initialized_payment=response)
+
+
+class MoneyInput(graphene.InputObjectType):
+    currency = graphene.String(description="Currency code.", required=True)
+    amount = PositiveDecimal(description="Amount of money.", required=True)
+
+
+class CardInput(graphene.InputObjectType):
+    code = graphene.String(
+        description=(
+            "Payment method nonce, a token returned "
+            "by the appropriate provider's SDK."
+        ),
+        required=True,
+    )
+    cvc = graphene.String(description="Card security code.", required=False)
+    money = MoneyInput(
+        description="Information about currency and amount.", required=True
+    )
+
+
+class PaymentCheckBalanceInput(graphene.InputObjectType):
+    gateway_id = graphene.types.String(
+        description="An ID of a payment gateway to check.", required=True
+    )
+    method = graphene.types.String(description="Payment method name.", required=True)
+    channel = graphene.String(
+        description="Slug of a channel for which the data should be returned.",
+        required=True,
+    )
+    card = CardInput(description="Information about card.", required=True)
+
+
+class PaymentCheckBalance(BaseMutation):
+    data = JSONString(description="Response from the gateway.")
+
+    class Arguments:
+        input = PaymentCheckBalanceInput(
+            description="Fields required to check payment balance.", required=True
+        )
+
+    class Meta:
+        description = "Check payment balance."
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        manager = info.context.plugins
+        gateway_id = data["input"]["gateway_id"]
+        money = data["input"]["card"].get("money", {})
+
+        cls.validate_gateway(gateway_id, manager)
+        cls.validate_currency(money.currency, gateway_id, manager)
+
+        channel = data["input"].pop("channel")
+        validate_channel(channel, PaymentErrorCode)
+
+        try:
+            data = manager.check_payment_balance(data["input"], channel)
+        except PaymentError as e:
+            raise ValidationError(
+                str(e), code=PaymentErrorCode.BALANCE_CHECK_ERROR.value
+            )
+
+        return PaymentCheckBalance(data=data)
+
+    @classmethod
+    def validate_gateway(cls, gateway_id, manager):
+        gateways_id = [gateway.id for gateway in manager.list_payment_gateways()]
+
+        if gateway_id not in gateways_id:
+            raise ValidationError(
+                {
+                    "gateway_id": ValidationError(
+                        f"The gateway_id {gateway_id} is not available.",
+                        code=PaymentErrorCode.NOT_SUPPORTED_GATEWAY.value,
+                    )
+                }
+            )
+
+    @classmethod
+    def validate_currency(cls, currency, gateway_id, manager):
+        if not is_currency_supported(currency, gateway_id, manager):
+            raise ValidationError(
+                {
+                    "currency": ValidationError(
+                        f"The currency {currency} is not available for {gateway_id}.",
+                        code=PaymentErrorCode.NOT_SUPPORTED_GATEWAY.value,
+                    )
+                }
+            )

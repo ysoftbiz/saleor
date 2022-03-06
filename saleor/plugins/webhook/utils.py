@@ -1,15 +1,30 @@
 import decimal
+import json
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
+from time import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from django.db.models import QuerySet
+
+from ...core.models import (
+    EventDelivery,
+    EventDeliveryAttempt,
+    EventDeliveryStatus,
+    EventPayload,
+)
 from ...payment.interface import GatewayResponse, PaymentGateway, PaymentMethodInfo
 
 if TYPE_CHECKING:
     from ...app.models import App
     from ...payment.interface import PaymentData
+    from .tasks import WebhookResponse
 
 
-APP_GATEWAY_ID_PREFIX = "app"
+APP_ID_PREFIX = "app"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,17 +33,19 @@ class PaymentAppData:
     name: str
 
 
+@dataclass
+class ShippingAppData:
+    app_pk: int
+    shipping_method_id: str
+
+
 def to_payment_app_id(app: "App", gateway_id: str) -> "str":
-    return f"{APP_GATEWAY_ID_PREFIX}:{app.pk}:{gateway_id}"
+    return f"{APP_ID_PREFIX}:{app.pk}:{gateway_id}"
 
 
 def from_payment_app_id(app_gateway_id: str) -> Optional["PaymentAppData"]:
     splitted_id = app_gateway_id.split(":")
-    if (
-        len(splitted_id) == 3
-        and splitted_id[0] == APP_GATEWAY_ID_PREFIX
-        and all(splitted_id)
-    ):
+    if len(splitted_id) == 3 and splitted_id[0] == APP_ID_PREFIX and all(splitted_id):
         try:
             app_pk = int(splitted_id[1])
         except (TypeError, ValueError):
@@ -41,7 +58,10 @@ def from_payment_app_id(app_gateway_id: str) -> Optional["PaymentAppData"]:
 def parse_list_payment_gateways_response(
     response_data: Any, app: "App"
 ) -> List["PaymentGateway"]:
-    gateways = []
+    gateways: List[PaymentGateway] = []
+    if not isinstance(response_data, list):
+        return gateways
+
     for gateway_data in response_data:
         gateway_id = gateway_data.get("id")
         gateway_name = gateway_data.get("name")
@@ -104,3 +124,76 @@ def parse_payment_action_response(
             "transaction_already_processed", False
         ),
     )
+
+
+@contextmanager
+def catch_duration_time():
+    start = time()
+    yield lambda: time() - start
+
+
+def create_event_delivery_list_for_webhooks(
+    webhooks: QuerySet,
+    event_payload: "EventPayload",
+    event_type: str,
+) -> List[EventDelivery]:
+
+    event_deliveries = EventDelivery.objects.bulk_create(
+        [
+            EventDelivery(
+                status=EventDeliveryStatus.PENDING,
+                event_type=event_type,
+                payload=event_payload,
+                webhook=webhook,
+            )
+            for webhook in webhooks
+        ]
+    )
+    return event_deliveries
+
+
+def create_attempt(
+    delivery: "EventDelivery",
+    task_id: str = None,
+):
+    attempt = EventDeliveryAttempt.objects.create(
+        delivery=delivery,
+        task_id=task_id,
+        duration=None,
+        response=None,
+        request_headers=None,
+        response_headers=None,
+        status=EventDeliveryStatus.PENDING,
+    )
+    return attempt
+
+
+def attempt_update(
+    attempt: "EventDeliveryAttempt",
+    webhook_response: "WebhookResponse",
+):
+
+    attempt.duration = webhook_response.duration
+    attempt.response = webhook_response.content
+    attempt.response_headers = json.dumps(webhook_response.response_headers)
+    attempt.request_headers = json.dumps(webhook_response.request_headers)
+    attempt.status = webhook_response.status
+    attempt.save(
+        update_fields=[
+            "duration",
+            "response",
+            "response_headers",
+            "request_headers",
+            "status",
+        ]
+    )
+
+
+def delivery_update(delivery: "EventDelivery", status: str):
+    delivery.status = status
+    delivery.save(update_fields=["status"])
+
+
+def clear_successful_delivery(delivery: "EventDelivery"):
+    if delivery.status == EventDeliveryStatus.SUCCESS:
+        delivery.delete()

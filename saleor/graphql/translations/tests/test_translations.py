@@ -4,9 +4,10 @@ from unittest.mock import patch
 import graphene
 import pytest
 from django.contrib.auth.models import Permission
+from freezegun import freeze_time
 
 from ....tests.utils import dummy_editorjs
-from ....webhook.event_types import WebhookEventType
+from ....webhook.event_types import WebhookEventAsyncType
 from ....webhook.payloads import generate_translation_payload
 from ...core.enums import LanguageCodeEnum
 from ...tests.utils import assert_no_permission, get_graphql_content
@@ -817,19 +818,28 @@ PRODUCT_TRANSLATE_MUTATION = """
                     }
                 }
             }
+            errors {
+                field
+                code
+            }
         }
     }
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     product,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     product_id = graphene.Node.to_global_id("Product", product.id)
@@ -844,9 +854,9 @@ def test_product_create_translation(
     assert data["product"]["translation"]["language"]["code"] == "PL"
 
     translation = product.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -920,14 +930,63 @@ def test_product_create_translation_by_translatable_content_id(
     assert data["product"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+def test_product_create_translation_validates_name_length(
+    staff_api_client, product, permission_manage_translations
+):
+    product_id = graphene.Node.to_global_id("Product", product.id)
+    variables = {
+        "productId": product_id,
+        "input": {"description": None, "name": "Long" * 100},
+    }
+    response = staff_api_client.post_graphql(
+        PRODUCT_TRANSLATE_MUTATION,
+        variables,
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["productTranslate"]
+
+    assert data["product"] is None
+    assert data["errors"] == [
+        {"field": "name", "code": "INVALID"},
+    ]
+
+
+def test_product_create_translation_by_invalid_translatable_content_id(
+    staff_api_client, product, permission_manage_translations
+):
+    translatable_content_id = (
+        "UHJvZHVjdFRyYW5zbGF0YWJsZUNvbnRlbnQ6NDkxMyd8fERCTVN"
+        "fUElQRS5SRUNFSVZFX01FU1NBR0UoQ0hSKDk4KXx8Q0hSKDk4KXx8Q"
+        "0hSKDk4KSwxNSl8fA=="
+    )
+
+    # String decodes to
+    # ProductTranslatableContent:4913'||
+    # DBMS_PIPE.RECEIVE_MESSAGE(CHR(98)||CHR(98)||CHR(98),15)||
+    response = staff_api_client.post_graphql(
+        PRODUCT_TRANSLATE_MUTATION,
+        {"productId": translatable_content_id, "input": {"name": "Produkt PL"}},
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["productTranslate"]
+    errors = data["errors"][0]
+    assert errors["code"] == "INVALID"
+    assert errors["field"] == "id"
+
+
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     product,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = product.translations.create(language_code="pl", name="Produkt")
@@ -944,9 +1003,9 @@ def test_product_update_translation(
     assert data["product"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -965,20 +1024,29 @@ mutation productVariantTranslate(
                 }
             }
         }
+        errors {
+            field
+            code
+        }
     }
 }
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_variant_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     variant,
     channel_USD,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     product_variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
@@ -993,9 +1061,9 @@ def test_product_variant_create_translation(
     assert data["productVariant"]["translation"]["language"]["code"] == "PL"
 
     translation = variant.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1018,14 +1086,19 @@ def test_product_variant_create_translation_by_translatable_content_id(
     assert data["productVariant"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_variant_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     variant,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = variant.translations.create(language_code="pl", name="Wariant")
@@ -1042,10 +1115,37 @@ def test_product_variant_update_translation(
     assert data["productVariant"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
+
+
+def test_product_variant_translation_mutation_validates_inputs_length(
+    staff_api_client,
+    variant,
+    channel_USD,
+    permission_manage_translations,
+):
+    translatable_content_id = graphene.Node.to_global_id(
+        "ProductVariantTranslatableContent", variant.id
+    )
+    response = staff_api_client.post_graphql(
+        PRODUCT_VARIANT_TRANSLATE_MUTATION,
+        {
+            "productVariantId": translatable_content_id,
+            "input": {"name": "Wariant PL" * 100},
+        },
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["productVariantTranslate"]
+    assert data["productVariant"] is None
+    assert data["errors"] == [
+        {
+            "field": "name",
+            "code": "INVALID",
+        }
+    ]
 
 
 COLLECTION_TRANSLATE_MUTATION = """
@@ -1062,19 +1162,28 @@ mutation collectionTranslate($collectionId: ID!, $input: TranslationInput!) {
                 }
             }
         }
+        errors {
+            field
+            code
+        }
     }
 }
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_collection_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     published_collection,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     collection_id = graphene.Node.to_global_id("Collection", published_collection.id)
@@ -1089,9 +1198,9 @@ def test_collection_create_translation(
     assert data["collection"]["translation"]["language"]["code"] == "PL"
 
     translation = published_collection.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1150,14 +1259,19 @@ def test_collection_create_translation_for_description_name_as_null(
     assert data["collection"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_collection_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     published_collection,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = published_collection.translations.create(
@@ -1176,10 +1290,29 @@ def test_collection_update_translation(
     assert data["collection"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
+
+
+def test_collection_translation_mutation_validates_inputs_length(
+    staff_api_client, published_collection, permission_manage_translations
+):
+    collection_id = graphene.Node.to_global_id("Collection", published_collection.id)
+    description = dummy_editorjs("description", True)
+    response = staff_api_client.post_graphql(
+        COLLECTION_TRANSLATE_MUTATION,
+        {
+            "collectionId": collection_id,
+            "input": {"description": description, "name": "long" * 100},
+        },
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["collectionTranslate"]
+
+    assert data["collection"] is None
+    assert data["errors"] == [{"field": "name", "code": "INVALID"}]
 
 
 CATEGORY_TRANSLATE_MUTATION = """
@@ -1201,14 +1334,19 @@ mutation categoryTranslate($categoryId: ID!, $input: TranslationInput!) {
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_category_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     category,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     category_id = graphene.Node.to_global_id("Category", category.id)
@@ -1223,9 +1361,9 @@ def test_category_create_translation(
     assert data["category"]["translation"]["language"]["code"] == "PL"
 
     translation = category.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1284,14 +1422,19 @@ def test_category_create_translation_for_description_name_as_null(
     assert data["category"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_category_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     category,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = category.translations.create(language_code="pl", name="Kategoria")
@@ -1308,9 +1451,9 @@ def test_category_update_translation(
     assert data["category"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1332,14 +1475,19 @@ VOUCHER_TRANSLATE_MUTATION = """
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_voucher_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     voucher,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     voucher_id = graphene.Node.to_global_id("Voucher", voucher.id)
@@ -1354,9 +1502,9 @@ def test_voucher_create_translation(
     assert data["voucher"]["translation"]["language"]["code"] == "PL"
 
     translation = voucher.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1378,14 +1526,19 @@ def test_voucher_create_translation_by_translatable_content_id(
     assert data["voucher"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_voucher_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     voucher,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     translation = voucher.translations.create(language_code="pl", name="Kategoria")
 
@@ -1401,9 +1554,9 @@ def test_voucher_update_translation(
     assert data["voucher"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1425,14 +1578,19 @@ SALE_TRANSLATION_MUTATION = """
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_sale_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     sale,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     sale_id = graphene.Node.to_global_id("Sale", sale.id)
@@ -1447,9 +1605,9 @@ def test_sale_create_translation(
     assert data["sale"]["translation"]["language"]["code"] == "PL"
 
     translation = sale.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1471,14 +1629,19 @@ def test_sale_create_translation_by_translatable_content_id(
     assert data["sale"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_sale_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     sale,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = sale.translations.create(language_code="pl", name="Sale")
@@ -1495,9 +1658,9 @@ def test_sale_update_translation(
     assert data["sale"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1520,14 +1683,19 @@ mutation pageTranslate($pageId: ID!, $input: PageTranslationInput!) {
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_page_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     page,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     page_id = graphene.Node.to_global_id("Page", page.id)
@@ -1542,9 +1710,9 @@ def test_page_create_translation(
     assert data["page"]["translation"]["language"]["code"] == "PL"
 
     translation = page.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1600,14 +1768,19 @@ def test_page_create_translation_by_translatable_content_id(
     assert data["page"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_page_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     page,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     translation = page.translations.create(language_code="pl", title="Strona")
 
@@ -1623,9 +1796,9 @@ def test_page_update_translation(
     assert data["page"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1649,14 +1822,19 @@ ATTRIBUTE_TRANSLATE_MUTATION = """
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     color_attribute,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
@@ -1671,9 +1849,9 @@ def test_attribute_create_translation(
     assert data["attribute"]["translation"]["language"]["code"] == "PL"
 
     translation = color_attribute.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1695,14 +1873,19 @@ def test_attribute_create_translation_by_translatable_content_id(
     assert data["attribute"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     color_attribute,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = color_attribute.translations.create(language_code="pl", name="Kolor")
@@ -1719,9 +1902,9 @@ def test_attribute_update_translation(
     assert data["attribute"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1745,14 +1928,19 @@ ATTRIBUTE_VALUE_TRANSLATE_MUTATION = """
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_value_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     pink_attribute_value,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     attribute_value_id = graphene.Node.to_global_id(
@@ -1769,9 +1957,9 @@ def test_attribute_value_create_translation(
     assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
 
     translation = pink_attribute_value.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1791,14 +1979,19 @@ def test_attribute_value_create_translation_by_translatable_content_id(
     assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_value_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     pink_attribute_value,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = pink_attribute_value.translations.create(
@@ -1819,9 +2012,9 @@ def test_attribute_value_update_translation(
     assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1843,22 +2036,31 @@ SHIPPING_PRICE_TRANSLATE = """
                     }
                 }
             }
+            errors {
+                message
+                code
+            }
         }
     }
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shipping_method_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     shipping_method,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     shipping_method_id = graphene.Node.to_global_id(
-        "ShippingMethod", shipping_method.id
+        "ShippingMethodType", shipping_method.id
     )
     description = dummy_editorjs("description", True)
     variables = {
@@ -1877,9 +2079,9 @@ def test_shipping_method_create_translation(
     assert data["shippingMethod"]["translation"]["language"]["code"] == "PL"
 
     translation = shipping_method.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
@@ -1908,14 +2110,19 @@ def test_shipping_method_create_translation_by_translatable_content_id(
     assert data["shippingMethod"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shipping_method_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     shipping_method,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = shipping_method.translations.create(language_code="pl", name="DHL")
@@ -1938,7 +2145,7 @@ def test_shipping_method_update_translation(
     """
 
     shipping_method_id = graphene.Node.to_global_id(
-        "ShippingMethod", shipping_method.id
+        "ShippingMethodType", shipping_method.id
     )
     response = staff_api_client.post_graphql(
         query,
@@ -1951,9 +2158,9 @@ def test_shipping_method_update_translation(
     assert data["shippingMethod"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -1976,14 +2183,19 @@ MENU_ITEM_TRANSLATE = """
 """
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_menu_item_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     menu_item,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = menu_item.translations.create(language_code="pl", name="Odnośnik")
@@ -2002,9 +2214,9 @@ def test_menu_item_update_translation(
     assert data["menuItem"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
 
 
@@ -2024,14 +2236,19 @@ def test_menu_item_create_translation_by_translatable_content_id(
     assert data["menuItem"]["translation"]["language"]["code"] == "PL"
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shop_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     site_settings,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     query = """
@@ -2059,30 +2276,16 @@ def test_shop_create_translation(
     assert data["shop"]["translation"]["language"]["code"] == "PL"
 
     translation = site_settings.translations.first()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_CREATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED, [any_webhook]
     )
 
 
-@patch("saleor.plugins.webhook.plugin.trigger_webhooks_for_event.delay")
-def test_shop_update_translation(
-    mocked_webhook_trigger,
-    staff_api_client,
-    site_settings,
-    permission_manage_translations,
-    settings,
-):
-    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
-
-    translation = site_settings.translations.create(
-        language_code="pl", header_text="Nagłówek"
-    )
-
-    query = """
-    mutation shopSettingsTranslate {
+SHOP_SETTINGS_TRANSLATE_MUTATION = """
+    mutation shopSettingsTranslate($input: ShopSettingsTranslationInput!) {
         shopSettingsTranslate(
-                languageCode: PL, input: {headerText: "Nagłówek PL"}) {
+                languageCode: PL, input: $input) {
             shop {
                 translation(languageCode: PL) {
                     headerText
@@ -2091,12 +2294,38 @@ def test_shop_update_translation(
                     }
                 }
             }
+            errors {
+                field
+                code
+            }
         }
     }
-    """
+"""
+
+
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_shop_update_translation(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    site_settings,
+    permission_manage_translations,
+    settings,
+):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    translation = site_settings.translations.create(
+        language_code="pl", header_text="Nagłówek"
+    )
 
     response = staff_api_client.post_graphql(
-        query, permissions=[permission_manage_translations]
+        SHOP_SETTINGS_TRANSLATE_MUTATION,
+        {"input": {"headerText": "Nagłówek PL"}},
+        permissions=[permission_manage_translations],
     )
     data = get_graphql_content(response)["data"]["shopSettingsTranslate"]
 
@@ -2104,10 +2333,32 @@ def test_shop_update_translation(
     assert data["shop"]["translation"]["language"]["code"] == "PL"
 
     translation.refresh_from_db()
-    expected_payload = generate_translation_payload(translation)
+    expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        WebhookEventType.TRANSLATION_UPDATED, expected_payload
+        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED, [any_webhook]
     )
+
+
+@freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_shop_translation_validates_values_lengths(
+    mocked_webhook_trigger,
+    staff_api_client,
+    site_settings,
+    permission_manage_translations,
+    settings,
+):
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    response = staff_api_client.post_graphql(
+        SHOP_SETTINGS_TRANSLATE_MUTATION,
+        {"input": {"headerText": "Nagłówek PL" * 100}},
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["shopSettingsTranslate"]
+
+    assert data["shop"] is None
+    assert data["errors"] == [{"field": "headerText", "code": "INVALID"}]
 
 
 @pytest.mark.parametrize(
@@ -2147,6 +2398,7 @@ def test_translations_query(
                     __typename
                 }
             }
+            totalCount
         }
     }
     """
@@ -2157,6 +2409,7 @@ def test_translations_query(
     data = get_graphql_content(response)["data"]["translations"]
 
     assert data["edges"][0]["node"]["__typename"] == expected_typename
+    assert data["totalCount"] > 0
 
 
 def test_translations_query_inline_fragment(
@@ -2531,7 +2784,7 @@ def test_translation_query_shipping_method(
     return_shipping_method,
 ):
     shipping_method_id = graphene.Node.to_global_id(
-        "ShippingMethod", shipping_method.id
+        "ShippingMethodType", shipping_method.id
     )
     perms = list(Permission.objects.filter(codename__in=perm_codenames))
 

@@ -1,15 +1,13 @@
-from typing import Union
+from typing import Type, Union, cast
 
 import graphene
 from django.db.models import Model
 from graphene.types.resolver import get_default_resolver
-from graphene_django import DjangoObjectType
 
 from ...channel import models
 from ...core.permissions import ChannelPermissions
-from ..core.connection import CountableDjangoObjectType
 from ..core.descriptions import ADDED_IN_31
-from ..core.types import CountryDisplay
+from ..core.types import CountryDisplay, ModelObjectType
 from ..decorators import permission_required
 from ..meta.types import ObjectWithMetadata
 from ..translations.resolvers import resolve_translation
@@ -17,7 +15,7 @@ from . import ChannelContext
 from .dataloaders import ChannelWithHasOrdersByIdLoader
 
 
-class ChannelContextType(DjangoObjectType):
+class ChannelContextTypeForObjectType(graphene.ObjectType):
     """A Graphene type that supports resolvers' root as ChannelContext objects."""
 
     class Meta:
@@ -34,22 +32,36 @@ class ChannelContextType(DjangoObjectType):
     def resolve_id(root: ChannelContext, _info):
         return root.node.pk
 
-    @classmethod
-    def is_type_of(cls, root: Union[ChannelContext, Model], info):
-        # Unwrap node from ChannelContext if it didn't happen already
-        if isinstance(root, ChannelContext):
-            return super().is_type_of(root.node, info)
-
-        # Check type that was already unwrapped by the Entity union check
-        return super().is_type_of(root, info)
-
     @staticmethod
     def resolve_translation(root: ChannelContext, info, language_code):
         # Resolver for TranslationField; needs to be manually specified.
         return resolve_translation(root.node, info, language_code)
 
 
-class ChannelContextTypeWithMetadata(ChannelContextType):
+class ChannelContextType(ChannelContextTypeForObjectType, ModelObjectType):
+    """A Graphene type that supports resolvers' root as ChannelContext objects."""
+
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def is_type_of(cls, root: Union[ChannelContext, Model], info):
+        # Unwrap node from ChannelContext if it didn't happen already
+        if isinstance(root, ChannelContext):
+            root = cast(Model, root.node)
+
+        if isinstance(root, cls):
+            return True
+
+        if cls._meta.model._meta.proxy:
+            model = root._meta.model
+        else:
+            model = cast(Type[Model], root._meta.model._meta.concrete_model)
+
+        return model == cls._meta.model
+
+
+class ChannelContextTypeWithMetadataForObjectType(ChannelContextTypeForObjectType):
     """A Graphene type for that uses ChannelContext as root in resolvers.
 
     Same as ChannelContextType, but for types that implement ObjectWithMetadata
@@ -70,7 +82,26 @@ class ChannelContextTypeWithMetadata(ChannelContextType):
         return ObjectWithMetadata.resolve_private_metadata(root.node, info)
 
 
-class Channel(CountableDjangoObjectType):
+class ChannelContextTypeWithMetadata(
+    ChannelContextTypeWithMetadataForObjectType, ChannelContextType
+):
+    """A Graphene type for that uses ChannelContext as root in resolvers.
+
+    Same as ChannelContextType, but for types that implement ObjectWithMetadata
+    interface.
+    """
+
+    class Meta:
+        abstract = True
+
+
+class Channel(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    name = graphene.String(required=True)
+    is_active = graphene.Boolean(required=True)
+    slug = graphene.String(required=True)
+    currency_code = graphene.String(required=True)
+    slug = graphene.String(required=True)
     has_orders = graphene.Boolean(
         required=True, description="Whether a channel has associated orders."
     )
@@ -88,7 +119,6 @@ class Channel(CountableDjangoObjectType):
         description = "Represents channel."
         model = models.Channel
         interfaces = [graphene.relay.Node]
-        only_fields = ["id", "name", "slug", "currency_code", "is_active"]
 
     @staticmethod
     @permission_required(ChannelPermissions.MANAGE_CHANNELS)

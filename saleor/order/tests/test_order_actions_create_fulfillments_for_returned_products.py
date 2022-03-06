@@ -3,17 +3,13 @@ from unittest.mock import ANY, patch
 
 from prices import Money, TaxedMoney
 
+from ...payment.interface import RefundData
 from ...plugins.manager import get_plugins_manager
 from ...tests.utils import flush_post_commit_hooks
 from ...warehouse.models import Allocation, Stock
-from .. import (
-    FulfillmentLineData,
-    FulfillmentStatus,
-    OrderEvents,
-    OrderLineData,
-    OrderOrigin,
-)
+from .. import FulfillmentLineData, FulfillmentStatus, OrderEvents, OrderOrigin
 from ..actions import create_fulfillments_for_returned_products
+from ..fetch import OrderLineInfo
 from ..models import Fulfillment, FulfillmentLine
 
 
@@ -45,7 +41,7 @@ def test_create_return_fulfillment_only_order_lines(
         order=order_with_lines,
         payment=payment,
         order_lines=[
-            OrderLineData(line=line, quantity=2, replace=False)
+            OrderLineInfo(line=line, quantity=2, replace=False)
             for line in order_lines_to_return
         ],
         fulfillment_lines=[],
@@ -113,15 +109,16 @@ def test_create_return_fulfillment_only_order_lines_with_refund(
     )
     lines_count = order_with_lines.lines.count()
 
+    order_lines_to_refund = [
+        OrderLineInfo(line=line, quantity=2, replace=False)
+        for line in order_lines_to_return
+    ]
     response = create_fulfillments_for_returned_products(
         user=staff_user,
         app=None,
         order=order_with_lines,
         payment=payment,
-        order_lines=[
-            OrderLineData(line=line, quantity=2, replace=False)
-            for line in order_lines_to_return
-        ],
+        order_lines=order_lines_to_refund,
         fulfillment_lines=[],
         manager=get_plugins_manager(),
         refund=True,
@@ -154,6 +151,9 @@ def test_create_return_fulfillment_only_order_lines_with_refund(
         ANY,
         amount=amount,
         channel_slug=order_with_lines.channel.slug,
+        refund_data=RefundData(
+            order_lines_to_refund=order_lines_to_refund,
+        ),
     )
     assert not replace_order
 
@@ -185,15 +185,16 @@ def test_create_return_fulfillment_only_order_lines_included_shipping_costs(
     )
     lines_count = order_with_lines.lines.count()
 
+    order_lines_to_refund = [
+        OrderLineInfo(line=line, quantity=2, replace=False)
+        for line in order_lines_to_return
+    ]
     response = create_fulfillments_for_returned_products(
         user=staff_user,
         app=None,
         order=order_with_lines,
         payment=payment,
-        order_lines=[
-            OrderLineData(line=line, quantity=2, replace=False)
-            for line in order_lines_to_return
-        ],
+        order_lines=order_lines_to_refund,
         fulfillment_lines=[],
         manager=get_plugins_manager(),
         refund=True,
@@ -228,6 +229,10 @@ def test_create_return_fulfillment_only_order_lines_included_shipping_costs(
         ANY,
         amount=amount,
         channel_slug=order_with_lines.channel.slug,
+        refund_data=RefundData(
+            order_lines_to_refund=order_lines_to_refund,
+            refund_shipping_costs=True,
+        ),
     )
     assert not replace_order
 
@@ -263,7 +268,7 @@ def test_create_return_fulfillment_only_order_lines_with_replace_request(
     lines_count = order_with_lines.lines.count()
     quantity_to_replace = 2
     order_lines_data = [
-        OrderLineData(line=line, quantity=2, replace=False)
+        OrderLineInfo(line=line, quantity=2, replace=False)
         for line in order_lines_to_return
     ]
 
@@ -577,6 +582,7 @@ def test_create_return_fulfillment_with_lines_already_refunded(
     refunded_fulfillment_line = refunded_fulfillment.lines.create(
         order_line=order_line, quantity=2
     )
+    fulfilled_order.fulfillments.add(refunded_fulfillment)
 
     fulfillment_lines_to_process = [
         FulfillmentLineData(line=line, quantity=2)
@@ -622,6 +628,9 @@ def test_create_return_fulfillment_with_lines_already_refunded(
         ANY,
         amount=amount,
         channel_slug=fulfilled_order.channel.slug,
+        refund_data=RefundData(
+            fulfillment_lines_to_refund=fulfillment_lines_to_process,
+        ),
     )
 
     assert returned_and_refunded_fulfillment.total_refund_amount == amount

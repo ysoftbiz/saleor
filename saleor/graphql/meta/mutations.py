@@ -1,14 +1,16 @@
 from typing import List
 
 import graphene
-from django.core.exceptions import ValidationError
+from django.core.exceptions import FieldDoesNotExist, ValidationError
 from graphql.error.base import GraphQLError
 
+from ...checkout import models as checkout_models
 from ...core import models
 from ...core.error_codes import MetadataErrorCode
 from ...core.exceptions import PermissionDenied
 from ...discount import models as discount_models
 from ...menu import models as menu_models
+from ...order import models as order_models
 from ...product import models as product_models
 from ...shipping import models as shipping_models
 from ..channel import ChannelContext
@@ -19,6 +21,18 @@ from ..payment.utils import metadata_contains_empty_key
 from .extra_methods import MODEL_EXTRA_METHODS, MODEL_EXTRA_PREFETCH
 from .permissions import PRIVATE_META_PERMISSION_MAP, PUBLIC_META_PERMISSION_MAP
 from .types import ObjectWithMetadata
+
+
+def _save_instance(instance, metadata_field: str):
+    fields = [metadata_field]
+
+    try:
+        if bool(instance._meta.get_field("updated_at")):
+            fields.append("updated_at")
+    except FieldDoesNotExist:
+        pass
+
+    instance.save(update_fields=fields)
 
 
 class MetadataPermissionOptions(graphene.types.mutation.MutationOptions):
@@ -52,7 +66,36 @@ class BaseMetadataMutation(BaseMutation):
     def get_instance(cls, info, **data):
         object_id = data.get("id")
         qs = data.get("qs", None)
-        return cls.get_node_or_error(info, object_id, qs=qs)
+
+        try:
+            type_name, _ = from_global_id_or_error(object_id)
+            # ShippingMethodType represents the ShippingMethod model
+            if type_name == "ShippingMethodType":
+                qs = shipping_models.ShippingMethod.objects
+            return cls.get_node_or_error(info, object_id, qs=qs)
+        except GraphQLError as e:
+            if instance := cls.get_instance_by_token(object_id, qs):
+                return instance
+            raise ValidationError(
+                {
+                    "id": ValidationError(
+                        str(e), code=MetadataErrorCode.GRAPHQL_ERROR.value
+                    )
+                }
+            )
+
+    @classmethod
+    def get_instance_by_token(cls, object_id, qs):
+        if not qs:
+            if order := order_models.Order.objects.filter(token=object_id).first():
+                return order
+            if checkout := checkout_models.Checkout.objects.filter(
+                token=object_id
+            ).first():
+                return checkout
+            return None
+        if qs and "token" in [field.name for field in qs.model._meta.get_fields()]:
+            return qs.filter(token=object_id).first()
 
     @classmethod
     def validate_model_is_model_with_metadata(cls, model, object_id):
@@ -79,16 +122,10 @@ class BaseMetadataMutation(BaseMutation):
             )
 
     @classmethod
-    def get_model_for_type_name(cls, info, type_name):
-        graphene_type = info.schema.get_type(type_name).graphene_type
-        return graphene_type._meta.model
-
-    @classmethod
-    def get_permissions(cls, info, **data):
-        object_id = data.get("id")
-        if not object_id:
+    def get_permissions(cls, info, type_name, object_pk, **data):
+        if object_pk is None:
             return []
-        type_name, object_pk = from_global_id_or_error(object_id)
+        object_id = data.get("id")
         model = cls.get_model_for_type_name(info, type_name)
         cls.validate_model_is_model_with_metadata(model, object_id)
         permission = cls._meta.permission_map.get(type_name)
@@ -101,9 +138,22 @@ class BaseMetadataMutation(BaseMutation):
         )
 
     @classmethod
+    def get_model_for_type_name(cls, info, type_name):
+        if type_name in ["ShippingMethodType", "ShippingMethod"]:
+            return shipping_models.ShippingMethod
+
+        graphene_type = info.schema.get_type(type_name).graphene_type
+
+        if hasattr(graphene_type, "get_model"):
+            return graphene_type.get_model()
+
+        return graphene_type._meta.model
+
+    @classmethod
     def mutate(cls, root, info, **data):
+        type_name, object_pk = cls.get_object_type_name_and_pk(data)
         try:
-            permissions = cls.get_permissions(info, **data)
+            permissions = cls.get_permissions(info, type_name, object_pk, **data)
         except GraphQLError as e:
             error = ValidationError(
                 {"id": ValidationError(str(e), code="graphql_error")}
@@ -112,19 +162,40 @@ class BaseMetadataMutation(BaseMutation):
         except ValidationError as e:
             return cls.handle_errors(e)
         if not cls.check_permissions(info.context, permissions):
-            raise PermissionDenied()
+            raise PermissionDenied(permissions=permissions)
         try:
             result = super().mutate(root, info, **data)
             if not result.errors:
-                cls.perform_model_extra_actions(root, info, **data)
+                cls.perform_model_extra_actions(root, info, type_name, **data)
         except ValidationError as e:
             return cls.handle_errors(e)
         return result
 
     @classmethod
-    def perform_model_extra_actions(cls, root, info, **data):
+    def get_object_type_name_and_pk(cls, data):
+        object_id = data.get("id")
+        if not object_id:
+            return None, None
+        try:
+            return from_global_id_or_error(object_id)
+        except GraphQLError:
+            if order := order_models.Order.objects.filter(token=object_id).first():
+                return "Order", order.pk
+            if checkout := checkout_models.Checkout.objects.filter(
+                token=object_id
+            ).first():
+                return "Checkout", checkout.pk
+            raise ValidationError(
+                {
+                    "id": ValidationError(
+                        "Couldn't resolve to a node.", code="graphql_error"
+                    )
+                }
+            )
+
+    @classmethod
+    def perform_model_extra_actions(cls, root, info, type_name, **data):
         """Run extra metadata method based on mutating model."""
-        type_name, _ = from_global_id_or_error(data["id"])
         if MODEL_EXTRA_METHODS.get(type_name):
             prefetch_method = MODEL_EXTRA_PREFETCH.get(type_name)
             if prefetch_method:
@@ -170,7 +241,10 @@ class UpdateMetadata(BaseMetadataMutation):
         error_type_field = "metadata_errors"
 
     class Arguments:
-        id = graphene.ID(description="ID of an object to update.", required=True)
+        id = graphene.ID(
+            description="ID or token (for Order and Checkout) of an object to update.",
+            required=True,
+        )
         input = graphene.List(
             graphene.NonNull(MetadataInput),
             description="Fields required to update the object's metadata.",
@@ -185,7 +259,7 @@ class UpdateMetadata(BaseMetadataMutation):
             cls.validate_metadata_keys(metadata_list)
             items = {data.key: data.value for data in metadata_list}
             instance.store_value_in_metadata(items=items)
-            instance.save(update_fields=["metadata"])
+            _save_instance(instance, "metadata")
         return cls.success_response(instance)
 
 
@@ -197,7 +271,10 @@ class DeleteMetadata(BaseMetadataMutation):
         error_type_field = "metadata_errors"
 
     class Arguments:
-        id = graphene.ID(description="ID of an object to update.", required=True)
+        id = graphene.ID(
+            description="ID or token (for Order and Checkout) of an object to update.",
+            required=True,
+        )
         keys = graphene.List(
             graphene.NonNull(graphene.String),
             description="Metadata keys to delete.",
@@ -211,7 +288,7 @@ class DeleteMetadata(BaseMetadataMutation):
             metadata_keys = data.pop("keys")
             for key in metadata_keys:
                 instance.delete_value_from_metadata(key)
-            instance.save(update_fields=["metadata"])
+            _save_instance(instance, "metadata")
         return cls.success_response(instance)
 
 
@@ -223,7 +300,10 @@ class UpdatePrivateMetadata(BaseMetadataMutation):
         error_type_field = "metadata_errors"
 
     class Arguments:
-        id = graphene.ID(description="ID of an object to update.", required=True)
+        id = graphene.ID(
+            description="ID or token (for Order and Checkout) of an object to update.",
+            required=True,
+        )
         input = graphene.List(
             graphene.NonNull(MetadataInput),
             description=("Fields required to update the object's metadata."),
@@ -238,7 +318,7 @@ class UpdatePrivateMetadata(BaseMetadataMutation):
             cls.validate_metadata_keys(metadata_list)
             items = {data.key: data.value for data in metadata_list}
             instance.store_value_in_private_metadata(items=items)
-            instance.save(update_fields=["private_metadata"])
+            _save_instance(instance, "private_metadata")
         return cls.success_response(instance)
 
 
@@ -250,7 +330,10 @@ class DeletePrivateMetadata(BaseMetadataMutation):
         error_type_field = "metadata_errors"
 
     class Arguments:
-        id = graphene.ID(description="ID of an object to update.", required=True)
+        id = graphene.ID(
+            description="ID or token (for Order and Checkout) of an object to update.",
+            required=True,
+        )
         keys = graphene.List(
             graphene.NonNull(graphene.String),
             description="Metadata keys to delete.",
@@ -264,5 +347,5 @@ class DeletePrivateMetadata(BaseMetadataMutation):
             metadata_keys = data.pop("keys")
             for key in metadata_keys:
                 instance.delete_value_from_private_metadata(key)
-            instance.save(update_fields=["private_metadata"])
+            _save_instance(instance, "private_metadata")
         return cls.success_response(instance)

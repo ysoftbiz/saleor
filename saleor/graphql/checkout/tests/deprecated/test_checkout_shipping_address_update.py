@@ -6,7 +6,7 @@ from .....checkout.error_codes import CheckoutErrorCode
 from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from .....plugins.manager import get_plugins_manager
 from ....tests.utils import get_graphql_content
-from ...mutations import update_checkout_shipping_method_if_invalid
+from ...mutations.utils import update_checkout_shipping_method_if_invalid
 
 MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE = """
     mutation checkoutShippingAddressUpdate(
@@ -30,7 +30,8 @@ MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE = """
 
 
 @mock.patch(
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    "saleor.graphql.checkout.mutations.checkout_shipping_address_update."
+    "update_checkout_shipping_method_if_invalid",
     wraps=update_checkout_shipping_method_if_invalid,
 )
 def test_checkout_shipping_address_update_by_id(
@@ -66,7 +67,7 @@ def test_checkout_shipping_address_update_by_id(
     assert checkout.shipping_address.country == shipping_address["country"]
     assert checkout.shipping_address.city == shipping_address["city"].upper()
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     mocked_update_shipping_method.assert_called_once_with(checkout_info, lines)
 

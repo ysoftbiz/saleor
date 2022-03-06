@@ -8,15 +8,15 @@ from ....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from ....checkout.models import Checkout
 from ....checkout.utils import add_variant_to_checkout
 from ....plugins.manager import get_plugins_manager
-from ...checkout.mutations import update_checkout_shipping_method_if_invalid
 from ...tests.utils import get_graphql_content
+from ..mutations.utils import update_checkout_shipping_method_if_invalid
 from .test_checkout import (
     MUTATION_CHECKOUT_CREATE,
     MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE,
     MUTATION_UPDATE_SHIPPING_METHOD,
 )
 from .test_checkout_lines import (
-    MUTATION_CHECKOUT_LINES_DELETE,
+    MUTATION_CHECKOUT_LINE_DELETE,
     MUTATION_CHECKOUT_LINES_UPDATE,
 )
 
@@ -73,6 +73,9 @@ def test_checkout_has_no_available_shipping_methods(
             checkout(token: $token) {
                 availableShippingMethods {
                     name
+                    price {
+                        amount
+                    }
                 }
             }
         }
@@ -159,7 +162,7 @@ def test_remove_shipping_method_if_only_digital_in_checkout(
 
     assert checkout.shipping_method
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     update_checkout_shipping_method_if_invalid(checkout_info, lines)
 
@@ -211,7 +214,7 @@ def test_checkout_line_delete_remove_shipping_if_removed_product_with_shipping(
     line_id = graphene.Node.to_global_id("CheckoutLine", line.pk)
 
     variables = {"token": checkout.token, "lineId": line_id}
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_DELETE, variables)
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINE_DELETE, variables)
     content = get_graphql_content(response)
 
     data = content["data"]["checkoutLineDelete"]

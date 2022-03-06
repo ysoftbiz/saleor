@@ -106,6 +106,27 @@ def test_category_query_object_with_invalid_object_type(
     assert content["data"]["category"] is None
 
 
+def test_category_query_doesnt_show_not_available_products(
+    user_api_client, product, channel_USD
+):
+    category = Category.objects.first()
+    variant = product.variants.get()
+    # Set product as not visible due to lack of price.
+    variant.channel_listings.update(price_amount=None)
+
+    variables = {
+        "id": graphene.Node.to_global_id("Category", category.pk),
+        "channel": channel_USD.slug,
+    }
+
+    response = user_api_client.post_graphql(QUERY_CATEGORY, variables=variables)
+    content = get_graphql_content(response)
+    category_data = content["data"]["category"]
+    assert category_data is not None
+    assert category_data["name"] == category.name
+    assert not category_data["products"]["edges"]
+
+
 def test_category_query_description(user_api_client, product, channel_USD):
     category = Category.objects.first()
     description = dummy_editorjs("Test description.", json_format=True)
@@ -373,8 +394,9 @@ def test_category_create_mutation(
     )
 
     category_name = "Test category"
+    description = "description"
     category_slug = slugify(category_name)
-    category_description = dummy_editorjs("description", True)
+    category_description = dummy_editorjs(description, True)
     image_file, image_name = create_image()
     image_alt = "Alt text for an image."
 
@@ -397,6 +419,7 @@ def test_category_create_mutation(
     assert data["category"]["description"] == category_description
     assert not data["category"]["parent"]
     category = Category.objects.get(name=category_name)
+    assert category.description_plaintext == description
     assert category.background_image.file
     img_name, format = os.path.splitext(image_file._name)
     file_name = category.background_image.name
@@ -544,8 +567,9 @@ def test_category_update_mutation(
     child_category = category.children.create(name="child")
 
     category_name = "Updated name"
+    description = "description"
     category_slug = slugify(category_name)
-    category_description = dummy_editorjs("description", True)
+    category_description = dummy_editorjs(description, True)
 
     image_file, image_name = create_image()
     image_alt = "Alt text for an image."
@@ -575,6 +599,7 @@ def test_category_update_mutation(
     parent_id = graphene.Node.to_global_id("Category", category.pk)
     assert data["category"]["parent"]["id"] == parent_id
     category = Category.objects.get(name=category_name)
+    assert category.description_plaintext == description
     assert category.background_image.file
     mock_create_thumbnails.assert_called_once_with(category.pk)
     assert data["category"]["backgroundImage"]["alt"] == image_alt
@@ -1002,7 +1027,6 @@ def test_categories_query_ids_not_exists(user_api_client, category):
     response = user_api_client.post_graphql(query, variables)
     content = get_graphql_content(response, ignore_errors=True)
     message_error = '{"ids": [{"message": "Invalid ID specified.", "code": ""}]}'
-
     assert len(content["errors"]) == 1
     assert content["errors"][0]["message"] == message_error
     assert content["data"]["categories"] is None

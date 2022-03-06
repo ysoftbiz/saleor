@@ -1,20 +1,22 @@
 from collections import defaultdict
 from datetime import date
-from typing import TYPE_CHECKING, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 from dateutil.relativedelta import relativedelta
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.db.models.expressions import Exists, OuterRef
 from django.utils import timezone
 
 from ..checkout.error_codes import CheckoutErrorCode
 from ..checkout.models import Checkout
+from ..core.tracing import traced_atomic_transaction
 from ..core.utils.promo_code import InvalidPromoCode, generate_promo_code
 from ..core.utils.validators import user_is_valid
 from ..order.actions import create_fulfillments
 from ..order.models import OrderLine
 from ..site import GiftCardSettingsExpiryType
-from . import GiftCardEvents, events
+from . import GiftCardEvents, GiftCardLineData, events
 from .models import GiftCard, GiftCardEvent
 from .notifications import send_gift_card_notification
 
@@ -51,6 +53,7 @@ def add_gift_card_code_to_checkout(
         raise InvalidPromoCode()
 
     checkout.gift_cards.add(gift_card)
+    checkout.save(update_fields=["last_change"])
 
 
 def remove_gift_card_code_from_checkout(checkout: Checkout, gift_card_code: str):
@@ -58,6 +61,7 @@ def remove_gift_card_code_from_checkout(checkout: Checkout, gift_card_code: str)
     gift_card = checkout.gift_cards.filter(code=gift_card_code).first()
     if gift_card:
         checkout.gift_cards.remove(gift_card)
+        checkout.save(update_fields=["last_change"])
 
 
 def deactivate_gift_card(gift_card: GiftCard):
@@ -87,10 +91,8 @@ def fulfill_non_shippable_gift_cards(
     gift_card_lines = get_non_shippable_gift_card_lines(order_lines)
     if not gift_card_lines:
         return
-    fulfill_gift_card_lines(gift_card_lines, requestor_user, app, order, manager)
-    quantities = {line.pk: line.quantity for line in gift_card_lines}
-    return gift_cards_create(
-        order, gift_card_lines, quantities, settings, requestor_user, app, manager
+    fulfill_gift_card_lines(
+        gift_card_lines, requestor_user, app, order, settings, manager
     )
 
 
@@ -112,6 +114,7 @@ def fulfill_gift_card_lines(
     requestor_user: Optional["User"],
     app: Optional["App"],
     order: "Order",
+    settings: "SiteSettings",
     manager: "PluginsManager",
 ):
     lines_for_warehouses = defaultdict(list)
@@ -145,14 +148,15 @@ def fulfill_gift_card_lines(
         order,
         dict(lines_for_warehouses),
         manager,
+        settings,
         notify_customer=True,
     )
 
 
+@traced_atomic_transaction()
 def gift_cards_create(
     order: "Order",
-    gift_card_lines: Iterable["OrderLine"],
-    quantities: Dict[int, int],
+    gift_card_lines_info: Iterable["GiftCardLineData"],
     settings: "SiteSettings",
     requestor_user: Optional["User"],
     app: Optional["App"],
@@ -164,7 +168,8 @@ def gift_cards_create(
     gift_cards = []
     non_shippable_gift_cards = []
     expiry_date = calculate_expiry_date(settings)
-    for order_line in gift_card_lines:
+    for line_data in gift_card_lines_info:
+        order_line = line_data.order_line
         price = order_line.unit_price_gross
         line_gift_cards = [
             GiftCard(  # type: ignore
@@ -173,10 +178,11 @@ def gift_cards_create(
                 current_balance=price,
                 created_by=customer_user,
                 created_by_email=user_email,
-                product=order_line.variant.product if order_line.variant else None,
+                product=line_data.variant.product if line_data.variant else None,
+                fulfillment_line=line_data.fulfillment_line,
                 expiry_date=expiry_date,
             )
-            for _ in range(quantities[order_line.pk])
+            for _ in range(line_data.quantity)
         ]
         gift_cards.extend(line_gift_cards)
         if not order_line.is_shipping_required:
@@ -187,14 +193,16 @@ def gift_cards_create(
 
     channel_slug = order.channel.slug
     # send to customer all non-shippable gift cards
-    send_gift_cards_to_customer(
-        non_shippable_gift_cards,
-        user_email,
-        requestor_user,
-        app,
-        customer_user,
-        manager,
-        channel_slug,
+    transaction.on_commit(
+        lambda: send_gift_cards_to_customer(
+            non_shippable_gift_cards,
+            user_email,
+            requestor_user,
+            app,
+            customer_user,
+            manager,
+            channel_slug,
+        )
     )
     return gift_cards
 
@@ -249,3 +257,14 @@ def deactivate_order_gift_cards(
 
 def order_has_gift_card_lines(order):
     return any(order.lines.filter(is_gift_card=True))
+
+
+def assign_user_gift_cards(user):
+    GiftCard.objects.filter(used_by_email=user.email).update(used_by=user)
+    GiftCard.objects.filter(created_by_email=user.email).update(created_by=user)
+
+
+def is_gift_card_expired(gift_card: GiftCard):
+    """Return True when gift card expiry date pass."""
+    today = timezone.now().date()
+    return bool(gift_card.expiry_date) and gift_card.expiry_date < today  # type: ignore

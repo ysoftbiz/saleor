@@ -566,7 +566,7 @@ def test_create_variant(
     sku = "1"
     weight = 10.22
     variant_slug = product_type.variant_attributes.first().slug
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
@@ -582,7 +582,7 @@ def test_create_variant(
         "sku": sku,
         "stocks": stocks,
         "weight": weight,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "trackInventory": True,
     }
     response = staff_api_client.post_graphql(
@@ -605,6 +605,10 @@ def test_create_variant(
     created_webhook_mock.assert_called_once_with(product.variants.last())
     updated_webhook_mock.assert_not_called()
 
+    product.refresh_from_db()
+    assert product.search_document
+    assert sku in product.search_document
+
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
 @patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
@@ -618,7 +622,7 @@ def test_create_variant_preorder(
 ):
     query = CREATE_VARIANT_MUTATION
     product_id = graphene.Node.to_global_id("Product", product.pk)
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
@@ -634,7 +638,7 @@ def test_create_variant_preorder(
         "productId": product_id,
         "sku": "1",
         "weight": 10.22,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "preorder": {
             "globalThreshold": global_threshold,
             "endDate": end_date,
@@ -655,6 +659,65 @@ def test_create_variant_preorder(
     assert data["preorder"]["endDate"] == end_date
     created_webhook_mock.assert_called_once_with(product.variants.last())
     updated_webhook_mock.assert_not_called()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_created")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_create_variant_no_required_attributes(
+    updated_webhook_mock,
+    created_webhook_mock,
+    staff_api_client,
+    product,
+    product_type,
+    permission_manage_products,
+    warehouse,
+):
+    query = CREATE_VARIANT_MUTATION
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    sku = "1"
+    weight = 10.22
+
+    attribute = product_type.variant_attributes.first()
+    attribute.value_required = False
+    attribute.save(update_fields=["value_required"])
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.pk),
+            "quantity": 20,
+        }
+    ]
+
+    variables = {
+        "productId": product_id,
+        "sku": sku,
+        "stocks": stocks,
+        "weight": weight,
+        "attributes": [],
+        "trackInventory": True,
+    }
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)["data"]["productVariantCreate"]
+    flush_post_commit_hooks()
+
+    assert not content["errors"]
+    data = content["productVariant"]
+    assert data["name"] == sku
+    assert data["sku"] == sku
+    assert not data["attributes"][0]["values"]
+    assert data["weight"]["unit"] == WeightUnitsEnum.KG.name
+    assert data["weight"]["value"] == weight
+    assert len(data["stocks"]) == 1
+    assert data["stocks"][0]["quantity"] == stocks[0]["quantity"]
+    assert data["stocks"][0]["warehouse"]["slug"] == warehouse.slug
+    created_webhook_mock.assert_called_once_with(product.variants.last())
+    updated_webhook_mock.assert_not_called()
+
+    product.refresh_from_db()
+    assert product.search_document
+    assert sku in product.search_document
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
@@ -730,7 +793,9 @@ def test_create_variant_with_boolean_attribute(
     size_attribute,
     warehouse,
 ):
-    product_type.variant_attributes.add(boolean_attribute)
+    product_type.variant_attributes.add(
+        boolean_attribute, through_defaults={"variant_selection": True}
+    )
     query = CREATE_VARIANT_MUTATION
     product_id = graphene.Node.to_global_id("Product", product.pk)
     boolean_attr_id = graphene.Node.to_global_id("Attribute", boolean_attribute.id)
@@ -1237,7 +1302,7 @@ def test_create_variant_with_numeric_attribute(
     weight = 10.22
     product_type.variant_attributes.set([numeric_attribute])
     variant_slug = numeric_attribute.slug
-    variant_id = graphene.Node.to_global_id("Attribute", numeric_attribute.pk)
+    attribute_id = graphene.Node.to_global_id("Attribute", numeric_attribute.pk)
     variant_value = "22.31"
     stocks = [
         {
@@ -1251,7 +1316,7 @@ def test_create_variant_with_numeric_attribute(
         "sku": sku,
         "stocks": stocks,
         "weight": weight,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "trackInventory": True,
     }
     response = staff_api_client.post_graphql(
@@ -1291,7 +1356,7 @@ def test_create_variant_with_numeric_attribute_not_numeric_value_given(
     sku = "1"
     weight = 10.22
     product_type.variant_attributes.set([numeric_attribute])
-    variant_id = graphene.Node.to_global_id("Attribute", numeric_attribute.pk)
+    attribute_id = graphene.Node.to_global_id("Attribute", numeric_attribute.pk)
     variant_value = "abd"
     stocks = [
         {
@@ -1305,7 +1370,7 @@ def test_create_variant_with_numeric_attribute_not_numeric_value_given(
         "sku": sku,
         "stocks": stocks,
         "weight": weight,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "trackInventory": True,
     }
     response = staff_api_client.post_graphql(
@@ -1327,7 +1392,7 @@ def test_create_product_variant_with_negative_weight(
     query = CREATE_VARIANT_MUTATION
     product_id = graphene.Node.to_global_id("Product", product.pk)
 
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
@@ -1335,7 +1400,7 @@ def test_create_product_variant_with_negative_weight(
     variables = {
         "productId": product_id,
         "weight": -1,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
     }
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -1347,12 +1412,17 @@ def test_create_product_variant_with_negative_weight(
     assert error["code"] == ProductErrorCode.INVALID.name
 
 
-def test_create_product_variant_without_attributes(
+def test_create_product_variant_required_without_attributes(
     staff_api_client, product, permission_manage_products
 ):
     # given
     query = CREATE_VARIANT_MUTATION
     product_id = graphene.Node.to_global_id("Product", product.pk)
+
+    attribute = product.product_type.variant_attributes.first()
+    attribute.value_required = True
+    attribute.save(update_fields=["value_required"])
+
     variables = {
         "productId": product_id,
         "sku": "test-sku",
@@ -1374,22 +1444,28 @@ def test_create_product_variant_without_attributes(
     assert error["code"] == ProductErrorCode.REQUIRED.name
 
 
-def test_create_product_variant_not_all_attributes(
+def test_create_product_variant_missing_required_attributes(
     staff_api_client, product, product_type, color_attribute, permission_manage_products
 ):
     query = CREATE_VARIANT_MUTATION
     product_id = graphene.Node.to_global_id("Product", product.pk)
     sku = "1"
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
-    product_type.variant_attributes.add(color_attribute)
+
+    color_attribute.value_required = True
+    color_attribute.save(update_fields=["value_required"])
+
+    product_type.variant_attributes.add(
+        color_attribute, through_defaults={"variant_selection": True}
+    )
 
     variables = {
         "productId": product_id,
         "sku": sku,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
     }
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -1400,7 +1476,7 @@ def test_create_product_variant_not_all_attributes(
         "field": "attributes",
         "code": ProductErrorCode.REQUIRED.name,
         "message": ANY,
-        "attributes": None,
+        "attributes": [graphene.Node.to_global_id("Attribute", color_attribute.pk)],
     }
     assert not product.variants.filter(sku=sku).exists()
 
@@ -1727,7 +1803,7 @@ def test_create_variant_with_empty_string_for_sku(
     sku = ""
     weight = 10.22
     variant_slug = product_type.variant_attributes.first().slug
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
@@ -1743,7 +1819,7 @@ def test_create_variant_with_empty_string_for_sku(
         "sku": sku,
         "stocks": stocks,
         "weight": weight,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "trackInventory": True,
     }
     response = staff_api_client.post_graphql(
@@ -1782,7 +1858,7 @@ def test_create_variant_without_sku(
     product_id = graphene.Node.to_global_id("Product", product.pk)
     weight = 10.22
     variant_slug = product_type.variant_attributes.first().slug
-    variant_id = graphene.Node.to_global_id(
+    attribute_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
@@ -1797,7 +1873,7 @@ def test_create_variant_without_sku(
         "productId": product_id,
         "stocks": stocks,
         "weight": weight,
-        "attributes": [{"id": variant_id, "values": [variant_value]}],
+        "attributes": [{"id": attribute_id, "values": [variant_value]}],
         "trackInventory": True,
     }
     response = staff_api_client.post_graphql(
@@ -1873,9 +1949,10 @@ def test_product_variant_update_with_new_attributes(
     variant_id = graphene.Node.to_global_id(
         "ProductVariant", product.variants.first().pk
     )
+    attr_value = "XXXL"
 
     variables = {
-        "attributes": [{"id": size_attribute_id, "values": ["XXXL"]}],
+        "attributes": [{"id": size_attribute_id, "values": [attr_value]}],
         "id": variant_id,
         "sku": "21599567",
         "trackInventory": True,
@@ -1893,6 +1970,10 @@ def test_product_variant_update_with_new_attributes(
     assert len(attributes) == 1
     assert attributes[0]["attribute"]["id"] == size_attribute_id
 
+    product.refresh_from_db()
+    assert product.search_document
+    assert attr_value.lower() in product.search_document
+
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
 @patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
@@ -1908,6 +1989,7 @@ def test_update_product_variant(
         mutation updateVariant (
             $id: ID!,
             $sku: String!,
+            $quantityLimitPerCustomer: Int!
             $trackInventory: Boolean!,
             $attributes: [AttributeValueInput!]) {
                 productVariantUpdate(
@@ -1916,10 +1998,12 @@ def test_update_product_variant(
                         sku: $sku,
                         trackInventory: $trackInventory,
                         attributes: $attributes,
+                        quantityLimitPerCustomer: $quantityLimitPerCustomer,
                     }) {
                     productVariant {
                         name
                         sku
+                        quantityLimitPerCustomer
                         channelListings {
                             channel {
                                 slug
@@ -1934,12 +2018,15 @@ def test_update_product_variant(
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     attribute_id = graphene.Node.to_global_id("Attribute", size_attribute.pk)
     sku = "test sku"
+    quantity_limit_per_customer = 5
+    attr_value = "S"
 
     variables = {
         "id": variant_id,
         "sku": sku,
         "trackInventory": True,
-        "attributes": [{"id": attribute_id, "values": ["S"]}],
+        "quantityLimitPerCustomer": quantity_limit_per_customer,
+        "attributes": [{"id": attribute_id, "values": [attr_value]}],
     }
 
     response = staff_api_client.post_graphql(
@@ -1952,10 +2039,15 @@ def test_update_product_variant(
 
     assert data["name"] == variant.name
     assert data["sku"] == sku
+    assert data["quantityLimitPerCustomer"] == quantity_limit_per_customer
     product_variant_updated_webhook_mock.assert_called_once_with(
         product.variants.last()
     )
     product_variant_created_webhook_mock.assert_not_called()
+
+    product.refresh_from_db()
+    assert product.search_document
+    assert attr_value.lower() in product.search_document
 
 
 def test_update_product_variant_with_negative_weight(
@@ -1997,6 +2089,43 @@ def test_update_product_variant_with_negative_weight(
     assert error["code"] == ProductErrorCode.INVALID.name
 
 
+@pytest.mark.parametrize("quantity_value", [0, -10])
+def test_update_product_variant_limit_per_customer_lower_than_1(
+    staff_api_client, product, permission_manage_products, quantity_value
+):
+    query = """
+        mutation updateVariant (
+            $id: ID!,
+            $quantityLimitPerCustomer: Int
+        ) {
+            productVariantUpdate(
+                id: $id,
+                input: {
+                    quantityLimitPerCustomer: $quantityLimitPerCustomer,
+                }
+            ){
+                errors {
+                    field
+                    message
+                    code
+                }
+            }
+        }
+    """
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    variables = {"id": variant_id, "quantityLimitPerCustomer": quantity_value}
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]
+    error = data["errors"][0]
+    assert error["field"] == "quantityLimitPerCustomer"
+    assert error["code"] == ProductErrorCode.INVALID.name
+
+
 QUERY_UPDATE_VARIANT_SKU = """
     mutation updateVariant (
         $id: ID!,
@@ -2025,16 +2154,20 @@ def test_update_product_variant_change_sku(
 ):
     variant = product.variants.first()
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-    variables = {"id": variant_id, "sku": "n3wSKU"}
+    sku = "n3wSKU"
+    variables = {"id": variant_id, "sku": sku}
     response = staff_api_client.post_graphql(
         QUERY_UPDATE_VARIANT_SKU, variables, permissions=[permission_manage_products]
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
     data = content["data"]["productVariantUpdate"]["productVariant"]
-    assert data["sku"] == "n3wSKU"
+    assert data["sku"] == sku
     variant.refresh_from_db()
-    assert variant.sku == "n3wSKU"
+    assert variant.sku == sku
+    product.refresh_from_db()
+    assert product.search_document
+    assert sku.lower() in product.search_document
 
 
 def test_update_product_variant_without_sku_keep_it_empty(
@@ -2088,7 +2221,7 @@ QUERY_UPDATE_VARIANT_ATTRIBUTES = """
     mutation updateVariant (
         $id: ID!,
         $sku: String,
-        $attributes: [AttributeValueInput!]!) {
+        $attributes: [AttributeValueInput!]) {
             productVariantUpdate(
                 id: $id,
                 input: {
@@ -2127,27 +2260,22 @@ QUERY_UPDATE_VARIANT_ATTRIBUTES = """
 """
 
 
-def test_update_product_variant_not_all_attributes(
-    staff_api_client, product, product_type, color_attribute, permission_manage_products
+def test_update_product_variant_do_not_require_required_attributes(
+    staff_api_client, product, product_type, permission_manage_products
 ):
-    """Ensures updating a variant with missing attributes (all attributes must
-    be provided) raises an error. We expect the color attribute
-    to be flagged as missing."""
+    """Ensures product variant can be updated without providing required attributes."""
 
     query = QUERY_UPDATE_VARIANT_ATTRIBUTES
     variant = product.variants.first()
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     sku = "test sku"
-    attr_id = graphene.Node.to_global_id(
-        "Attribute", product_type.variant_attributes.first().id
-    )
-    variant_value = "test-value"
-    product_type.variant_attributes.add(color_attribute)
+    attr = product_type.variant_attributes.first()
+    attr.value_required = True
+    attr.save(update_fields=["value_required"])
 
     variables = {
         "id": variant_id,
         "sku": sku,
-        "attributes": [{"id": attr_id, "values": [variant_value]}],
     }
 
     response = staff_api_client.post_graphql(
@@ -2155,13 +2283,11 @@ def test_update_product_variant_not_all_attributes(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    assert len(content["data"]["productVariantUpdate"]["errors"]) == 1
-    assert content["data"]["productVariantUpdate"]["errors"][0] == {
-        "field": "attributes",
-        "message": "All variant selection attributes must take a value.",
-        "code": ProductErrorCode.REQUIRED.name,
-    }
-    assert not product.variants.filter(sku=sku).exists()
+    data = content["data"]["productVariantUpdate"]
+    assert not len(data["errors"])
+    assert data["productVariant"]["sku"] == sku
+    assert len(data["productVariant"]["attributes"]) == 1
+    assert data["productVariant"]["attributes"][0]["values"]
 
 
 def test_update_product_variant_with_current_attribute(
@@ -2522,6 +2648,9 @@ def test_update_product_variant_clear_attributes(
     attribute = variant_attr.assignment.attribute
     attribute.input_type = AttributeInputType.MULTISELECT
     attribute.value_required = False
+    attribute_variant = attribute.attributevariant.get()
+    attribute_variant.variant_selection = False
+    attribute_variant.save(update_fields=["variant_selection"])
     attribute.save(update_fields=["value_required", "input_type"])
 
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
@@ -2951,7 +3080,6 @@ def test_update_product_variant_change_attribute_values_ordering(
 @pytest.mark.parametrize(
     "values, message, code",
     (
-        ([], "Attribute expects a value but none were given.", "REQUIRED"),
         (["one", "two"], "Attribute must take only one value.", "INVALID"),
         (["   "], "Attribute values cannot be blank.", "REQUIRED"),
     ),
@@ -2967,9 +3095,7 @@ def test_update_product_variant_requires_values(
 ):
     """Ensures updating a variant with invalid values raise an error.
 
-    - No values
     - Blank value
-    - None as value
     - More than one value
     """
 
@@ -2999,6 +3125,44 @@ def test_update_product_variant_requires_values(
         "field": "attributes",
         "message": message,
         "code": code,
+    }
+    assert not variant.product.variants.filter(sku=sku).exists()
+
+
+def test_update_product_variant_requires_attr_value_when_is_required(
+    staff_api_client,
+    variant,
+    product_type,
+    permission_manage_products,
+):
+    sku = "updated"
+
+    query = QUERY_UPDATE_VARIANT_ATTRIBUTES
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    attribute = product_type.variant_attributes.first()
+    attribute.value_required = True
+    attribute.save(update_fields=["value_required"])
+
+    attr_id = graphene.Node.to_global_id(
+        "Attribute", product_type.variant_attributes.first().id
+    )
+
+    variables = {
+        "id": variant_id,
+        "attributes": [{"id": attr_id, "values": []}],
+        "sku": sku,
+    }
+
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    assert len(content["data"]["productVariantUpdate"]["errors"]) == 1
+    assert content["data"]["productVariantUpdate"]["errors"][0] == {
+        "field": "attributes",
+        "message": "Attribute expects a value but none were given.",
+        "code": "REQUIRED",
     }
     assert not variant.product.variants.filter(sku=sku).exists()
 
@@ -3157,6 +3321,7 @@ def test_delete_variant(
     query = DELETE_VARIANT_MUTATION
     variant = product.variants.first()
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    variant_sku = variant.sku
     variables = {"id": variant_id}
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -3166,10 +3331,13 @@ def test_delete_variant(
     data = content["data"]["productVariantDelete"]
 
     product_variant_deleted_webhook_mock.assert_called_once_with(variant)
-    assert data["productVariant"]["sku"] == variant.sku
+    assert data["productVariant"]["sku"] == variant_sku
     with pytest.raises(variant._meta.model.DoesNotExist):
         variant.refresh_from_db()
     mocked_recalculate_orders_task.assert_not_called()
+    product.refresh_from_db()
+    assert product.search_document
+    assert variant_sku not in product.search_document
 
 
 def test_delete_variant_remove_checkout_lines(
@@ -3480,6 +3648,92 @@ def test_delete_default_all_product_variant_left_product_default_variant_unset(
     product.refresh_from_db()
     assert not product.default_variant
     mocked_recalculate_orders_task.assert_not_called()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_deleted")
+@patch("saleor.order.tasks.recalculate_orders_task.delay")
+def test_delete_variant_delete_product_channel_listing_without_available_channel(
+    mocked_recalculate_orders_task,
+    product_variant_deleted_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    """Ensure that when the last available variant for channel is removed,
+    the corresponging product channel listings will be removed too."""
+    # given
+    query = DELETE_VARIANT_MUTATION
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    variant_sku = variant.sku
+    variables = {"id": variant_id}
+
+    # second variant not available
+    ProductVariant.objects.create(product=product, sku="not-available-variant")
+
+    assert product.channel_listings.count() == 1
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    flush_post_commit_hooks()
+    data = content["data"]["productVariantDelete"]
+
+    product_variant_deleted_webhook_mock.assert_called_once_with(variant)
+    assert data["productVariant"]["sku"] == variant_sku
+    with pytest.raises(variant._meta.model.DoesNotExist):
+        variant.refresh_from_db()
+    mocked_recalculate_orders_task.assert_not_called()
+    product.refresh_from_db()
+    assert product.search_document
+    assert variant_sku not in product.search_document
+    assert product.channel_listings.count() == 0
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_deleted")
+@patch("saleor.order.tasks.recalculate_orders_task.delay")
+def test_delete_variant_delete_product_channel_listing_not_deleted(
+    mocked_recalculate_orders_task,
+    product_variant_deleted_webhook_mock,
+    staff_api_client,
+    product_with_two_variants,
+    permission_manage_products,
+):
+    """Ensure that any other available variant for channel exist,
+    the corresponging product channel listings will be not removed."""
+    # given
+    query = DELETE_VARIANT_MUTATION
+    product = product_with_two_variants
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    variant_sku = variant.sku
+    variables = {"id": variant_id}
+
+    product_channel_listing_count = product.channel_listings.count()
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    flush_post_commit_hooks()
+    data = content["data"]["productVariantDelete"]
+
+    product_variant_deleted_webhook_mock.assert_called_once_with(variant)
+    assert data["productVariant"]["sku"] == variant_sku
+    with pytest.raises(variant._meta.model.DoesNotExist):
+        variant.refresh_from_db()
+    mocked_recalculate_orders_task.assert_not_called()
+    product.refresh_from_db()
+    assert product.search_document
+    assert variant_sku not in product.search_document
+    assert product.channel_listings.count() == product_channel_listing_count
 
 
 def _fetch_all_variants(client, variables={}, permissions=None):
@@ -3945,13 +4199,18 @@ def test_product_variant_bulk_create_by_attribute_id(
     product.refresh_from_db()
     assert product.default_variant == product_variant
     assert product_variant_created_webhook_mock.call_count == data["count"]
+    assert product.search_document
+    assert sku in product.search_document
+    assert attribute_value.name.lower() in product.search_document
 
 
 def test_product_variant_bulk_create_with_swatch_attribute(
     staff_api_client, product, swatch_attribute, permission_manage_products
 ):
     product_variant_count = ProductVariant.objects.count()
-    product.product_type.variant_attributes.set([swatch_attribute])
+    product.product_type.variant_attributes.set(
+        [swatch_attribute], through_defaults={"variant_selection": True}
+    )
     attribute_value_count = swatch_attribute.values.count()
     product_id = graphene.Node.to_global_id("Product", product.pk)
     attribute_id = graphene.Node.to_global_id("Attribute", swatch_attribute.pk)
@@ -3991,6 +4250,9 @@ def test_product_variant_bulk_create_with_swatch_attribute(
     product_variant = ProductVariant.objects.get(sku=sku)
     product.refresh_from_db()
     assert product.default_variant == product_variant
+    assert product.search_document
+    assert variants[0]["sku"] in product.search_document
+    assert variants[1]["sku"] in product.search_document
 
 
 def test_product_variant_bulk_create_only_not_variant_selection_attributes(
@@ -4003,6 +4265,10 @@ def test_product_variant_bulk_create_only_not_variant_selection_attributes(
     attribute_value_count = size_attribute.values.count()
 
     size_attribute.input_type = AttributeInputType.MULTISELECT
+    variant_attribute = size_attribute.attributevariant.get()
+    variant_attribute.variant_selection = False
+    variant_attribute.save(update_fields=["variant_selection"])
+
     size_attribute.save(update_fields=["input_type"])
 
     product_id = graphene.Node.to_global_id("Product", product.pk)
@@ -4034,6 +4300,9 @@ def test_product_variant_bulk_create_only_not_variant_selection_attributes(
     product_variant = ProductVariant.objects.get(sku=sku)
     product.refresh_from_db()
     assert product.default_variant == product_variant
+    assert product.search_document
+    assert sku in product.search_document
+    assert attribute_value.name.lower() in product.search_document
 
 
 def test_product_variant_bulk_create_empty_attribute(
@@ -4052,7 +4321,10 @@ def test_product_variant_bulk_create_empty_attribute(
     data = content["data"]["productVariantBulkCreate"]
     assert not data["errors"]
     assert data["count"] == 1
+    product.refresh_from_db()
     assert product_variant_count + 1 == ProductVariant.objects.count()
+    assert product.search_document
+    assert variants[0]["sku"].lower() in product.search_document
 
 
 def test_product_variant_bulk_create_with_new_attribute_value(
@@ -5421,6 +5693,192 @@ def test_product_variant_stocks_delete_mutation_invalid_object_type_of_warehouse
     assert len(errors) == 1
     assert errors[0]["code"] == ProductErrorCode.GRAPHQL_ERROR.name
     assert errors[0]["field"] == "warehouseIds"
+
+
+VARIANT_UPDATE_AND_STOCKS_REMOVE_MUTATION = """
+  fragment ProductVariant on ProductVariant {
+    stocks {
+      id
+    }
+  }
+
+  mutation VariantUpdate($removeStocks: [ID!]!, $id: ID!) {
+    productVariantUpdate(id: $id, input: {}) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+    productVariantStocksDelete(variantId: $id, warehouseIds: $removeStocks) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+  }
+"""
+
+
+def test_invalidate_stocks_dataloader_on_removing_stocks(
+    staff_api_client, variant_with_many_stocks, permission_manage_products
+):
+    # given
+    variant = variant_with_many_stocks
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    warehouse_ids = [
+        graphene.Node.to_global_id("Warehouse", stock.warehouse.id)
+        for stock in variant_with_many_stocks.stocks.all()
+    ]
+    variables = {
+        "id": variant_id,
+        "removeStocks": warehouse_ids,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        VARIANT_UPDATE_AND_STOCKS_REMOVE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    variant_data = content["data"]["productVariantUpdate"]["productVariant"]
+    remove_stocks_data = content["data"]["productVariantStocksDelete"]["productVariant"]
+
+    # no stocks were removed in the first mutation
+    assert len(variant_data["stocks"]) == len(warehouse_ids)
+
+    # stocks are empty in the second mutation
+    assert remove_stocks_data["stocks"] == []
+
+
+VARIANT_UPDATE_AND_STOCKS_CREATE_MUTATION = """
+  fragment ProductVariant on ProductVariant {
+    id
+    name
+    stocks {
+      quantity
+      warehouse {
+        id
+        name
+      }
+    }
+  }
+
+  mutation VariantUpdate($id: ID!, $stocks: [StockInput!]!) {
+    productVariantUpdate(id: $id, input: {}) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+    productVariantStocksCreate(variantId: $id, stocks: $stocks) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+  }
+"""
+
+
+def test_invalidate_stocks_dataloader_on_create_stocks(
+    staff_api_client, variant_with_many_stocks, permission_manage_products
+):
+    # given
+    variant = variant_with_many_stocks
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    warehouse_ids = [
+        graphene.Node.to_global_id("Warehouse", stock.warehouse.id)
+        for stock in variant_with_many_stocks.stocks.all()
+    ]
+    variant.stocks.all().delete()
+    variables = {
+        "id": variant_id,
+        "stocks": [
+            {"warehouse": warehouse_id, "quantity": 10}
+            for warehouse_id in warehouse_ids
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        VARIANT_UPDATE_AND_STOCKS_CREATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    variant_data = content["data"]["productVariantUpdate"]["productVariant"]
+    create_stocks_data = content["data"]["productVariantStocksCreate"]["productVariant"]
+
+    # no stocks are present after the first mutation
+    assert variant_data["stocks"] == []
+
+    # stocks are returned in the second mutation, after dataloader invalidation
+    assert len(create_stocks_data["stocks"]) == len(warehouse_ids)
+
+
+VARIANT_UPDATE_AND_STOCKS_UPDATE_MUTATION = """
+  fragment ProductVariant on ProductVariant {
+    id
+    name
+    stocks {
+      quantity
+      warehouse {
+        id
+        name
+      }
+    }
+  }
+
+  mutation VariantUpdate($id: ID!, $stocks: [StockInput!]!) {
+    productVariantUpdate(id: $id, input: {}) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+    productVariantStocksUpdate(variantId: $id, stocks: $stocks) {
+      productVariant {
+        ...ProductVariant
+      }
+    }
+  }
+"""
+
+
+def test_invalidate_stocks_dataloader_on_update_stocks(
+    staff_api_client, variant_with_many_stocks, permission_manage_products
+):
+    # given
+    variant = variant_with_many_stocks
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    stock = variant.stocks.first()
+    # keep only one stock record for test purposes
+    variant.stocks.exclude(id=stock.id).delete()
+    warehouse_id = graphene.Node.to_global_id("Warehouse", stock.warehouse.id)
+    old_quantity = stock.quantity
+    new_quantity = old_quantity + 500
+    variables = {
+        "id": variant_id,
+        "stocks": [{"warehouse": warehouse_id, "quantity": new_quantity}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        VARIANT_UPDATE_AND_STOCKS_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    variant_data = content["data"]["productVariantUpdate"]["productVariant"]
+    update_stocks_data = content["data"]["productVariantStocksUpdate"]["productVariant"]
+
+    # stocks is not updated in the first mutation
+    assert variant_data["stocks"][0]["quantity"] == old_quantity
+
+    # stock is updated in the second mutation
+    assert update_stocks_data["stocks"][0]["quantity"] == new_quantity
 
 
 def test_query_product_variant_for_federation(api_client, variant, channel_USD):

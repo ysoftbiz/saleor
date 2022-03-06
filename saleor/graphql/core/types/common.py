@@ -137,6 +137,11 @@ class CheckoutError(Error):
         description="List of varint IDs which causes the error.",
         required=False,
     )
+    lines = graphene.List(
+        graphene.NonNull(graphene.ID),
+        description="List of line Ids which cause the error.",
+        required=False,
+    )
     address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
@@ -312,10 +317,20 @@ class PageError(Error):
 
 class PaymentError(Error):
     code = PaymentErrorCode(description="The error code.", required=True)
+    variants = graphene.List(
+        graphene.NonNull(graphene.ID),
+        description="List of varint IDs which causes the error.",
+        required=False,
+    )
 
 
 class GiftCardError(Error):
     code = GiftCardErrorCode(description="The error code.", required=True)
+    tags = graphene.List(
+        graphene.NonNull(graphene.String),
+        description="List of tag values that cause the error.",
+        required=False,
+    )
 
 
 class PluginError(Error):

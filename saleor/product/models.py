@@ -5,8 +5,9 @@ from uuid import uuid4
 import graphene
 from django.conf import settings
 from django.contrib.postgres.aggregates import StringAgg
-from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.indexes import BTreeIndex, GinIndex
 from django.contrib.postgres.search import SearchVectorField
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import JSONField  # type: ignore
 from django.db.models import (
@@ -79,6 +80,7 @@ class Category(ModelWithMetadata, MPTTModel, SeoModel):
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description_plaintext = TextField(blank=True)
     parent = models.ForeignKey(
         "self", null=True, blank=True, related_name="children", on_delete=models.CASCADE
     )
@@ -90,6 +92,17 @@ class Category(ModelWithMetadata, MPTTModel, SeoModel):
     objects = models.Manager()
     tree = TreeManager()
     translated = TranslationProxy()
+
+    class Meta:
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="category_search_name_slug_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug", "description_plaintext"],
+                opclasses=["gin_trgm_ops"] * 3,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -153,6 +166,15 @@ class ProductType(ModelWithMetadata):
                 "Manage product types and attributes.",
             ),
         )
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="product_type_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -355,6 +377,8 @@ class ProductsQueryset(models.QuerySet):
             "variants__attributes__assignment__attribute",
             "variants__variant_media__media",
             "variants__stocks__allocations",
+            "variants__channel_listings__channel",
+            "channel_listings__channel",
         )
         if single_object:
             return self.prefetch_related(*common_fields)
@@ -369,7 +393,7 @@ class Product(SeoModel, ModelWithMetadata):
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
     description_plaintext = TextField(blank=True)
-    search_vector = SearchVectorField(null=True, blank=True)
+    search_document = models.TextField(blank=True, default="")
 
     category = models.ForeignKey(
         Category,
@@ -378,7 +402,8 @@ class Product(SeoModel, ModelWithMetadata):
         null=True,
         blank=True,
     )
-    updated_at = models.DateTimeField(auto_now=True, null=True)
+    created = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
     charge_taxes = models.BooleanField(default=True)
     weight = MeasurementField(
         measurement=Weight,
@@ -404,7 +429,14 @@ class Product(SeoModel, ModelWithMetadata):
         permissions = (
             (ProductPermissions.MANAGE_PRODUCTS.codename, "Manage products."),
         )
-        indexes = [GinIndex(fields=["search_vector"])]
+        indexes = [
+            GinIndex(
+                name="product_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["search_document"],
+                opclasses=["gin_trgm_ops"],
+            ),
+        ]
         indexes.extend(ModelWithMetadata.Meta.indexes)
 
     def __iter__(self):
@@ -423,10 +455,6 @@ class Product(SeoModel, ModelWithMetadata):
 
     def __str__(self) -> str:
         return self.name
-
-    @property
-    def plain_text_description(self) -> str:
-        return json_content_to_raw_text(self.description)
 
     def get_first_image(self):
         all_media = self.media.all()
@@ -530,6 +558,7 @@ class ProductChannelListing(PublishableModel):
         ordering = ("pk",)
         indexes = [
             models.Index(fields=["publication_date"]),
+            BTreeIndex(fields=["discounted_price_amount"]),
         ]
 
     def is_available_for_purchase(self):
@@ -550,6 +579,11 @@ class ProductVariant(SortableModel, ModelWithMetadata):
     is_preorder = models.BooleanField(default=False)
     preorder_end_date = models.DateTimeField(null=True, blank=True)
     preorder_global_threshold = models.IntegerField(blank=True, null=True)
+    quantity_limit_per_customer = models.IntegerField(
+        blank=True, null=True, validators=[MinValueValidator(1)]
+    )
+    created = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
     weight = MeasurementField(
         measurement=Weight,
@@ -748,7 +782,9 @@ class DigitalContentUrl(models.Model):
 
 
 class ProductMedia(SortableModel):
-    product = models.ForeignKey(Product, related_name="media", on_delete=models.CASCADE)
+    product = models.ForeignKey(
+        Product, related_name="media", on_delete=models.SET_NULL, null=True, blank=True
+    )
     image = VersatileImageField(
         upload_to="products", ppoi_field="ppoi", blank=True, null=True
     )
@@ -761,6 +797,7 @@ class ProductMedia(SortableModel):
     )
     external_url = models.CharField(max_length=256, blank=True, null=True)
     oembed_data = JSONField(blank=True, default=dict)
+    to_remove = models.BooleanField(default=False)
 
     class Meta:
         ordering = ("sort_order", "pk")
@@ -817,7 +854,7 @@ class CollectionsQueryset(models.QuerySet):
 
 
 class Collection(SeoModel, ModelWithMetadata):
-    name = models.CharField(max_length=250, unique=True)
+    name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     products = models.ManyToManyField(
         Product,
@@ -838,6 +875,15 @@ class Collection(SeoModel, ModelWithMetadata):
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("slug",)
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="collection_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name

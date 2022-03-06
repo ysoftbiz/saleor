@@ -1,8 +1,9 @@
 import graphene
 
 from ...core.permissions import AppPermission
-from ..core.descriptions import ADDED_IN_31
-from ..core.fields import FilterInputConnectionField
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.descriptions import ADDED_IN_31, PREVIEW_FEATURE
+from ..core.fields import FilterConnectionField
 from ..core.types import FilterInputObjectType
 from ..core.utils import from_global_id_or_error
 from ..decorators import permission_required, staff_member_or_app_required
@@ -29,7 +30,13 @@ from .resolvers import (
     resolve_apps_installations,
 )
 from .sorters import AppSortingInput
-from .types import App, AppExtension, AppInstallation
+from .types import (
+    App,
+    AppCountableConnection,
+    AppExtension,
+    AppExtensionCountableConnection,
+    AppInstallation,
+)
 
 
 class AppFilterInput(FilterInputObjectType):
@@ -48,8 +55,8 @@ class AppQueries(graphene.ObjectType):
         description="List of all apps installations",
         required=True,
     )
-    apps = FilterInputConnectionField(
-        App,
+    apps = FilterConnectionField(
+        AppCountableConnection,
         filter=AppFilterInput(description="Filtering options for apps."),
         sort_by=AppSortingInput(description="Sort apps."),
         description="List of the apps.",
@@ -63,19 +70,19 @@ class AppQueries(graphene.ObjectType):
         ),
     )
 
-    app_extensions = FilterInputConnectionField(
-        AppExtension,
+    app_extensions = FilterConnectionField(
+        AppExtensionCountableConnection,
         filter=AppExtensionFilterInput(
             description="Filtering options for apps extensions."
         ),
-        description=f"{ADDED_IN_31} List of all extensions",
+        description=f"{ADDED_IN_31} List of all extensions. {PREVIEW_FEATURE}",
     )
     app_extension = graphene.Field(
         AppExtension,
         id=graphene.Argument(
             graphene.ID, description="ID of the app extension.", required=True
         ),
-        description=f"{ADDED_IN_31} Look up an app extension by ID.",
+        description=f"{ADDED_IN_31} Look up an app extension by ID. {PREVIEW_FEATURE}",
     )
 
     @permission_required(AppPermission.MANAGE_APPS)
@@ -84,7 +91,9 @@ class AppQueries(graphene.ObjectType):
 
     @permission_required(AppPermission.MANAGE_APPS)
     def resolve_apps(self, info, **kwargs):
-        return resolve_apps(info, **kwargs)
+        qs = resolve_apps(info, **kwargs)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, AppCountableConnection)
 
     def resolve_app(self, info, id=None):
         app = info.context.app
@@ -94,7 +103,11 @@ class AppQueries(graphene.ObjectType):
 
     @staff_member_or_app_required
     def resolve_app_extensions(self, info, **kwargs):
-        return resolve_app_extensions(info)
+        qs = resolve_app_extensions(info)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(
+            qs, info, kwargs, AppExtensionCountableConnection
+        )
 
     @staff_member_or_app_required
     def resolve_app_extension(self, info, id):

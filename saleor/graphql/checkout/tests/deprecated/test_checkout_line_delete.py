@@ -7,7 +7,7 @@ from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from .....checkout.utils import calculate_checkout_quantity
 from .....plugins.manager import get_plugins_manager
 from ....tests.utils import get_graphql_content
-from ...mutations import update_checkout_shipping_method_if_invalid
+from ...mutations.utils import update_checkout_shipping_method_if_invalid
 
 MUTATION_CHECKOUT_LINES_DELETE = """
     mutation checkoutLineDelete($checkoutId: ID, $token: UUID, $lineId: ID!) {
@@ -32,14 +32,15 @@ MUTATION_CHECKOUT_LINES_DELETE = """
 
 
 @mock.patch(
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    "saleor.graphql.checkout.mutations.checkout_line_delete."
+    "update_checkout_shipping_method_if_invalid",
     wraps=update_checkout_shipping_method_if_invalid,
 )
 def test_checkout_line_delete_by_id(
     mocked_update_shipping_method, user_api_client, checkout_with_item
 ):
     checkout = checkout_with_item
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     assert calculate_checkout_quantity(lines) == 3
     assert checkout.lines.count() == 1
     line = checkout.lines.first()
@@ -55,7 +56,7 @@ def test_checkout_line_delete_by_id(
     data = content["data"]["checkoutLineDelete"]
     assert not data["errors"]
     checkout.refresh_from_db()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     assert checkout.lines.count() == 0
     assert calculate_checkout_quantity(lines) == 0
     manager = get_plugins_manager()

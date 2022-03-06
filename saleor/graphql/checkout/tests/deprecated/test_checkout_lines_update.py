@@ -7,7 +7,7 @@ from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from .....checkout.utils import calculate_checkout_quantity
 from .....plugins.manager import get_plugins_manager
 from ....tests.utils import get_graphql_content
-from ...mutations import update_checkout_shipping_method_if_invalid
+from ...mutations.utils import update_checkout_shipping_method_if_invalid
 
 MUTATION_CHECKOUT_LINES_UPDATE = """
     mutation checkoutLinesUpdate(
@@ -35,14 +35,15 @@ MUTATION_CHECKOUT_LINES_UPDATE = """
 
 
 @mock.patch(
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    "saleor.graphql.checkout.mutations.checkout_lines_add."
+    "update_checkout_shipping_method_if_invalid",
     wraps=update_checkout_shipping_method_if_invalid,
 )
 def test_checkout_lines_update(
     mocked_update_shipping_method, user_api_client, checkout_with_item
 ):
     checkout = checkout_with_item
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     assert checkout.lines.count() == 1
     assert calculate_checkout_quantity(lines) == 3
     line = checkout.lines.first()
@@ -62,7 +63,7 @@ def test_checkout_lines_update(
     data = content["data"]["checkoutLinesUpdate"]
     assert not data["errors"]
     checkout.refresh_from_db()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     assert checkout.lines.count() == 1
     line = checkout.lines.first()
     assert line.variant == variant
@@ -70,7 +71,7 @@ def test_checkout_lines_update(
     assert calculate_checkout_quantity(lines) == 1
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     mocked_update_shipping_method.assert_called_once_with(checkout_info, lines)
 
